@@ -1,0 +1,70 @@
+# Usage:
+#   export DATASET_PATH=/absolute/path/to/dataset_sequence_root
+#   docker compose build                    # builds all 5, once (~40-60 min total first time)
+#   docker compose run --rm zoedepth
+#   docker compose run --rm depthanythingv2
+#   docker compose run --rm fastdepth
+#   docker compose run --rm dpvo
+#   docker compose run --rm orbslam3
+#
+# Each writes into ./results/<algorithm>/ on the host (bind-mounted below).
+# See README.md for details, confidence levels per algorithm, and troubleshooting.
+
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+
+services:
+  zoedepth:
+    build: ./src/depth/zoedepth
+    image: thesis/zoedepth
+    <<: *gpu
+    volumes:
+      - ${DATASET_PATH}:/data:ro
+      - ${OUTPUT_PATH:-./results}/zoedepth:/out
+    command: ["--dataset_root", "/data", "--output", "/out"]
+
+  depthanythingv2:
+    build: ./src/depth/dav2
+    image: thesis/depthanythingv2
+    <<: *gpu
+    volumes:
+      - ${DATASET_PATH}:/data:ro
+      - ${OUTPUT_PATH:-./results}/depthanythingv2:/out
+    command: ["--dataset_root", "/data", "--output", "/out"]
+
+  fastdepth:
+    build: ./src/depth/fastdepth
+    image: thesis/fastdepth
+    <<: *gpu
+    volumes:
+      - ${DATASET_PATH}:/data:ro
+      - ${OUTPUT_PATH:-./results}/fastdepth:/out
+    command: ["--dataset_root", "/data", "--output", "/out"]
+
+  dpvo:
+    build: ./src/slam/dpvo
+    image: thesis/dpvo
+    <<: *gpu
+    volumes:
+      - ${DATASET_PATH}:/data:ro
+      - ${OUTPUT_PATH:-./results}/dpvo:/out
+    command: ["/data", "/out"]
+
+  orbslam3:
+    build: ./src/slam/orbslam3
+    image: thesis/orbslam3
+    # CPU-only algorithm -- no GPU block needed, sidesteps GPU passthrough
+    # issues entirely for this one.
+    volumes:
+      # mounted AS mav0/ -- ORB-SLAM3's EuRoC loader expects
+      # <sequence_root>/mav0/cam0/data internally, and this dataset has no
+      # mav0/ wrapper of its own.
+      - ${DATASET_PATH}:/data/mav0:ro
+      - ${OUTPUT_PATH:-./results}/orbslam3:/out
+    command: ["/data/mav0", "/out"]
