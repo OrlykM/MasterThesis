@@ -1,6 +1,18 @@
+"""
+Runs real FastDepth (MobileNet encoder + NNConv5 decoder, ICRA 2019
+architecture) on every frame in <dataset_root>/cam0/data.
+
+Model input is a fixed 224x224 (matches training) -- frames are resized down
+for inference then the output depth map is resized back up to the original
+camera resolution before saving, so it lines up pixel-for-pixel with the
+camera's actual intrinsics for backprojection. Also writes run_config.json
+documenting exactly what ran.
+"""
 import argparse
+import json
 import os
 import sys
+import time
 
 import numpy as np
 import torch
@@ -8,7 +20,7 @@ from PIL import Image
 from tqdm import tqdm
 
 sys.path.insert(0, "/opt/fastdepth")
-from models import FastDepth, FastDepthV2 
+from models import FastDepth, FastDepthV2  # noqa: E402
 
 
 def main():
@@ -39,6 +51,7 @@ def main():
 
     files = sorted(f for f in os.listdir(input_dir) if f.lower().endswith((".png", ".jpg", ".jpeg")))
     print(f"Running FastDepth ({args.variant}) on {len(files)} frames from {input_dir} ...")
+    t0 = time.time()
     for f in tqdm(files):
         img = Image.open(os.path.join(input_dir, f)).convert("RGB")
         orig_w, orig_h = img.size
@@ -51,8 +64,23 @@ def main():
         depth_224 = out.squeeze().cpu().numpy()
         depth_full = np.array(Image.fromarray(depth_224).resize((orig_w, orig_h), Image.BILINEAR))
         np.save(os.path.join(args.output, f.rsplit(".", 1)[0] + ".npy"), depth_full.astype(np.float32))
+    elapsed = time.time() - t0
 
-    print(f"Done: {len(files)} depth maps saved to {args.output}")
+    config = {
+        "algorithm": "FastDepth",
+        "model_checkpoint": weights_path,
+        "source_repo": "https://github.com/Hagaik92/FastDepth (modernized fork -- "
+                        "original 2019 repo has no working docker/build path)",
+        "params": vars(args),
+        "n_frames": len(files),
+        "elapsed_seconds": round(elapsed, 1),
+        "output_units": "meters (trained on NYU Depth v2)",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    with open(os.path.join(args.output, "run_config.json"), "w") as f:
+        json.dump(config, f, indent=2)
+
+    print(f"Done: {len(files)} depth maps + run_config.json saved to {args.output}")
 
 
 if __name__ == "__main__":
