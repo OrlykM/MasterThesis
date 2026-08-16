@@ -31,7 +31,7 @@ def looks_like_frame_index(est, tolerance=1e-6):
     diffs = np.diff(t)
     return np.allclose(diffs, 1.0, atol=tolerance) and abs(t[0]) < tolerance
 
-def looks_like_raw_nanoseconds(est, gt, ratio_tolerance=0.1):"
+def looks_like_raw_nanoseconds(est, gt, ratio_tolerance=0.1):
     ratio = np.median(est[:, 0]) / np.median(gt[:, 0])
     return abs(ratio - 1e9) / 1e9 < ratio_tolerance
 

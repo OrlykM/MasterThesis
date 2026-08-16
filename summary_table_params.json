@@ -1,0 +1,43 @@
+[
+  {
+    "algorithm": "DPVO",
+    "checkpoint": "/DPVO/dpvo.pth",
+    "param.stride": 1,
+    "param.extra_args": ""
+  },
+  {
+    "algorithm": "ORB-SLAM3",
+    "checkpoint": "?",
+    "param.ORB_NFEATURES": 1500,
+    "param.ORB_SCALEFACTOR": 1.2,
+    "param.ORB_NLEVELS": 8,
+    "param.ORB_INITHFAST": 20,
+    "param.ORB_MINTHFAST": 7
+  },
+  {
+    "algorithm": "ZoeDepth",
+    "checkpoint": "Intel/zoedepth-nyu-kitti",
+    "param.dataset_root": "/data",
+    "param.output": "/out",
+    "param.model": "Intel/zoedepth-nyu-kitti",
+    "param.device": "cuda"
+  },
+  {
+    "algorithm": "Depth-Anything-V2",
+    "checkpoint": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf",
+    "param.dataset_root": "/data",
+    "param.output": "/out",
+    "param.encoder": "large",
+    "param.scene": "outdoor",
+    "param.relative_depth": false,
+    "param.device": "cuda"
+  },
+  {
+    "algorithm": "FastDepth",
+    "checkpoint": "/opt/fastdepth/Weights/FastDepth_L1_Best.pth",
+    "param.dataset_root": "/data",
+    "param.output": "/out",
+    "param.variant": "v1",
+    "param.device": "cuda"
+  }
+]
