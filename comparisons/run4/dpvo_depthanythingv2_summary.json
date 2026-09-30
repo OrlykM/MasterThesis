@@ -1,0 +1,10 @@
+{
+  "vslam": "dpvo",
+  "fde": "depthanythingv2",
+  "ate_rmse_m": 150.3842405790074,
+  "rte_rmse_m": 1.881343049525533,
+  "rre_rmse_deg": 2.8170346093683785,
+  "recovered_scale": 1.1454659007667127,
+  "depth_abs_rel_sampled": 6.378228096436557,
+  "n_frames_sampled": 15
+}

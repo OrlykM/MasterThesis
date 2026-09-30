@@ -219,3 +219,10 @@ __marimo__/
 
 datasets/
 results/
+CLAUDE.md
+chat_context.md
+# Training cache for depth_net (11 GB of .npz + memmap .npy) -- rebuild with
+# depth_net_data.py --all --fde <model> && --to_memmap
+cache/
+# Trained checkpoints -- rebuild with depth_net.py train
+nets/

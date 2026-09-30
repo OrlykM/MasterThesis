@@ -1,0 +1,10 @@
+{
+  "vslam": "orbslam3",
+  "fde": "depthanythingv2",
+  "ate_rmse_m": 4.493905334189058,
+  "rte_rmse_m": 0.3766908638799287,
+  "rre_rmse_deg": 0.9779783108041437,
+  "recovered_scale": 32.64744056144554,
+  "depth_abs_rel_sampled": 5.335906611640378,
+  "n_frames_sampled": 15
+}

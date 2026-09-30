@@ -22,6 +22,16 @@ RUN git clone --branch v0.6 --recursive https://github.com/stevenlovegrove/Pango
 
 RUN git clone https://github.com/UZ-SLAMLab/ORB_SLAM3.git /ORB_SLAM3
 WORKDIR /ORB_SLAM3
+
+# Adds landmarks.txt export (per-frame tracked sparse map points, via the
+# existing System::GetTrackedMapPoints() API) to mono_euroc.cc -- needed by
+# depth_calibration.py to recalibrate FDE depth against VSLAM's own sparse
+# map. See patch_landmarks_export.py for why this is safe/verified and
+# run_config.json's old "known_limitation" note (which only covered full
+# map export, not per-frame tracked points).
+COPY patch_landmarks_export.py /tmp/patch_landmarks_export.py
+RUN python3 /tmp/patch_landmarks_export.py /ORB_SLAM3/Examples/Monocular/mono_euroc.cc
+
 RUN chmod +x build.sh && ./build.sh
 
 COPY entrypoint.sh /entrypoint.sh

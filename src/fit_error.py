@@ -1,3 +1,22 @@
+r"""
+Fits two empirical error models from data you've ALREADY measured -- no
+training, just least-squares curve fitting:
+
+  sigma_depth(z) = a + b*z    -- depth error growth with distance, per FDE model
+  sigma_pose(d)  = c + e*d    -- pose drift growth with distance traveled
+
+These replace the advisor's placeholder constants (a=0.05, b=0.05 etc.)
+with numbers derived from your own dataset/algorithms, which is the actual
+scientific contribution -- a calibrated reliability model instead of a
+guessed one.
+
+Usage:
+    python3 fit_error_models.py \
+        --dataset_root ~/MasterThesis/datasets/euroc/2026-04-01_..._quadrotor \
+        --vslam_dir ../../results/dpvo \
+        --fde_dir ../../results/zoedepth \
+        --output error_model_dpvo_zoedepth.json
+"""
 import argparse
 import copy
 import json
@@ -18,7 +37,13 @@ from evo.core import sync as evo_sync
 from evo.core import metrics as evo_metrics
 from evo.core.metrics import PoseRelation, StatisticsType
 
+
+# ---------- pose error model: ATE on growing trajectory prefixes ----------
+
 def drift_vs_distance(gt_m, est_m, n_windows=12):
+    """ATE (evo APE) computed on growing prefixes of the ALREADY-ASSOCIATED
+    (same length, same order) gt_m/est_m arrays -- this is what shows error
+    ACCUMULATING with distance, not one aggregate number."""
     xyz = gt_m[:, 1:4]
     seg_lengths = np.linalg.norm(np.diff(xyz, axis=0), axis=1)
     cum_dist = np.concatenate([[0.0], np.cumsum(seg_lengths)])
@@ -40,7 +65,12 @@ def drift_vs_distance(gt_m, est_m, n_windows=12):
         out.append((float(cum_dist[k - 1]), float(rmse)))
     return out
 
+
 def fit_linear(xs, ys):
+    """sigma(x) = a + b*x via least squares. Returns (a, b), clamping a>=0
+    (an error model can't start negative) and b>=0 (error shouldn't shrink
+    with distance -- if the fit wants that, the data doesn't support this
+    model shape and you should look at the points directly, not trust the fit)."""
     xs, ys = np.array(xs), np.array(ys)
     A = np.vstack([np.ones_like(xs), xs]).T
     (a, b), *_ = np.linalg.lstsq(A, ys, rcond=None)
@@ -49,23 +79,36 @@ def fit_linear(xs, ys):
     r2 = 1 - np.sum(residuals ** 2) / max(np.sum((ys - ys.mean()) ** 2), 1e-9)
     return {"shape": "linear", "a": float(a), "b": float(b), "r_squared": float(r2), "n_points": len(xs)}
 
+
 def fit_quadratic(xs, ys):
+    """sigma(x) = a + b*x + c*x^2 -- try this too and compare R^2, since VSLAM
+    drift often accelerates rather than growing linearly (confirmed by the
+    sanity test below: a truly quadratic synthetic drift only got R^2=0.49
+    from the linear fit)."""
     xs, ys = np.array(xs), np.array(ys)
     A = np.vstack([np.ones_like(xs), xs, xs ** 2]).T
     (a, b, c), *_ = np.linalg.lstsq(A, ys, rcond=None)
     a, b, c = max(a, 0.0), max(b, 0.0), max(c, 0.0)
     residuals = ys - (a + b * xs + c * xs ** 2)
     r2 = 1 - np.sum(residuals ** 2) / max(np.sum((ys - ys.mean()) ** 2), 1e-9)
-    return {"shape": "quadratic", "a": float(a), "b": float(b), "c": float(c), "r_squared": float(r2), "n_points": len(xs)}
+    return {"shape": "quadratic", "a": float(a), "b": float(b), "c": float(c),
+            "r_squared": float(r2), "n_points": len(xs)}
+
 
 def fit_best(xs, ys):
+    """Fits both shapes, returns whichever has higher R^2 -- with the
+    quadratic's R^2 required to beat linear by a real margin (0.03) since it
+    has an extra free parameter and will always fit >= as well numerically."""
     lin = fit_linear(xs, ys)
     quad = fit_quadratic(xs, ys)
     chosen = quad if quad["r_squared"] > lin["r_squared"] + 0.03 else lin
     return chosen, {"linear": lin, "quadratic": quad}
 
 
-def depth_error_vs_distance(dataset_root, fde_dir, n_frames, n_bins, gt_depth_scale, pred_depth_scale, min_depth, max_depth):
+# ---------- depth error model: error vs GT distance, binned ----------
+
+def depth_error_vs_distance(dataset_root, fde_dir, n_frames, n_bins, gt_depth_scale,
+                             pred_depth_scale, min_depth, max_depth):
     cam_csv_path = os.path.join(dataset_root, "cam0", "data.csv")
     sensor_yaml_path = os.path.join(dataset_root, "cam0", "sensor.yaml")
     gt_depth_dir = os.path.join(dataset_root, "depth0", "data")
@@ -113,6 +156,11 @@ def main():
     ap.add_argument("--dataset_root", required=True)
     ap.add_argument("--vslam_dir", required=True)
     ap.add_argument("--fde_dir", required=True)
+    ap.add_argument("--max_time_diff", type=float, default=0.15,
+                     help="max seconds between GT and estimated-pose timestamps to count as a "
+                          "match -- Isaac Sim datasets were tight sync (~ms, use 0.02), AirSim "
+                          "recordings have a confirmed ~81ms constant offset between IMU-clock "
+                          "GT and camera timestamps, hence the higher default here")
     ap.add_argument("--n_frames", type=int, default=80)
     ap.add_argument("--n_depth_bins", type=int, default=15)
     ap.add_argument("--gt_depth_scale", type=float, default=0.001)
@@ -139,9 +187,9 @@ def main():
 
     traj_ref = build_evo_trajectory(gt)
     traj_est = build_evo_trajectory(est)
-    traj_ref_sync, traj_est_sync = evo_sync.associate_trajectories(traj_ref, traj_est, max_diff=0.02)
+    traj_ref_sync, traj_est_sync = evo_sync.associate_trajectories(traj_ref, traj_est, max_diff=args.max_time_diff)
     gt_m = evo_traj_to_array(traj_ref_sync)
-    est_m_unaligned = evo_traj_to_array(traj_est_sync)  
+    est_m_unaligned = evo_traj_to_array(traj_est_sync)  # NOT aligned -- drift_vs_distance aligns per-prefix itself
 
     pose_points = drift_vs_distance(gt_m, est_m_unaligned, n_windows=12)
     if len(pose_points) < 3:

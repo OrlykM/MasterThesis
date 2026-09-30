@@ -1,3 +1,30 @@
+r"""
+Builds one interactive, rotatable 3D scene comparing your dataset's ground
+truth against one VSLAM+FDE combination's reconstruction -- both the
+trajectory AND the actual point-cloud reconstruction, properly aligned.
+
+Why "properly aligned" matters: DPVO and ORB-SLAM3 (monocular) have no
+absolute scale -- their trajectory is only correct up to an unknown scale
+factor and an arbitrary starting coordinate frame. Plotting their raw poses
+next to GT poses without alignment compares two numbers that don't live in
+the same coordinate system at all -- the comparison would be meaningless,
+not just visually off. This script aligns via evo's Sim(3) Umeyama
+implementation (rotation + translation + scale) -- the same industry-standard
+library used for ATE/RPE/RRE -- so what you see IS what gets measured.
+
+Usage:
+    python3 compare_reconstruction_3d.py \
+        --dataset_root ~/MasterThesis/datasets/euroc/euroc_runs/<run> \
+        --vslam_dir results/dpvo \
+        --fde_dir results/zoedepth \
+        --output compare_dpvo_zoedepth.html
+
+Assumes the dataset layout confirmed earlier in this project (no mav0/
+wrapper, CSV headers without '#', depth0 = 16-bit PNG 1px=1mm) and the
+results/<algorithm>/ layout the docker-compose setup produces:
+    results/dpvo/poses.txt            (or results/orbslam3/poses.txt)
+    results/zoedepth/*.npy            (or depthanythingv2/ or fastdepth/)
+"""
 import argparse
 import json
 import os
@@ -10,9 +37,17 @@ from evo.core.trajectory import PoseTrajectory3D
 from evo.core import sync as evo_sync
 from evo.core import metrics as evo_metrics
 from evo.core.metrics import PoseRelation, StatisticsType, Unit
+import gt_frame
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from euroc_io import load_gt_trajectory, load_camera_intrinsics, load_image_timestamps, pose_row_to_T, quat_to_rotmat
+from euroc_io import (load_gt_trajectory, load_camera_intrinsics, load_image_timestamps, pose_row_to_T,
+                       quat_to_rotmat, estimate_axis_convention_fix, body_to_camera)
+
+
+# ---------- trajectory: parsing, dataset-quirk handling ----------
+# (association/alignment/ATE/RPE themselves are evo's job, see build_evo_trajectory()
+# and the metrics block in main() -- this project's own code only handles getting
+# clean, correctly-timestamped data INTO evo, not the metric math itself.)
 
 def load_tum(path):
     rows = []
@@ -27,15 +62,27 @@ def load_tum(path):
 
 
 def looks_like_frame_index(est, tolerance=1e-6):
+    """Detects the DPVO-observed case where column 0 is 0,1,2,...N (sequential
+    frame indices) instead of real EuRoC nanosecond-derived timestamps --
+    those two are numerically incompatible with any real GT timestamp, so
+    evo's timestamp-based association would always find zero matches."""
     t = est[:, 0]
     diffs = np.diff(t)
     return np.allclose(diffs, 1.0, atol=tolerance) and abs(t[0]) < tolerance
 
+
 def looks_like_raw_nanoseconds(est, gt, ratio_tolerance=0.1):
+    """Detects the ORB-SLAM3-observed case where poses.txt echoes back raw
+    nanosecond timestamps (from the times.txt we generate as its input)
+    instead of converting to seconds like GT does -- the two end up ~1e9x
+    apart, so nearest-timestamp association finds zero matches."""
     ratio = np.median(est[:, 0]) / np.median(gt[:, 0])
     return abs(ratio - 1e9) / 1e9 < ratio_tolerance
 
+
 def remap_pseudo_timestamps(est, frames, stride):
+    """Replaces column 0 (sequential index i) with the REAL timestamp of the
+    i*stride-th camera frame, so evo's association against GT works correctly."""
     frame_times = np.array([f[0] for f in frames])
     remapped = est.copy()
     for row_idx in range(len(est)):
@@ -44,7 +91,10 @@ def remap_pseudo_timestamps(est, frames, stride):
         remapped[row_idx, 0] = frame_times[src_frame_idx]
     return remapped
 
+
 def load_vslam_stride(vslam_dir, default=1):
+    """Reads the stride actually used from run_config.json, written by the
+    docker entrypoints -- avoids guessing/hardcoding it here."""
     cfg_path = os.path.join(vslam_dir, "run_config.json")
     if os.path.exists(cfg_path):
         try:
@@ -55,17 +105,28 @@ def load_vslam_stride(vslam_dir, default=1):
             pass
     return default
 
+
 def build_evo_trajectory(tum_array):
+    """tum_array: Nx8 [t, tx, ty, tz, qx, qy, qz, qw] (TUM/EuRoC convention,
+    qw last) -> evo's PoseTrajectory3D (which wants qw FIRST -- easy to get
+    backwards, this is the one place that reordering happens)."""
     t = tum_array[:, 0]
     xyz = tum_array[:, 1:4]
     qx, qy, qz, qw = tum_array[:, 4], tum_array[:, 5], tum_array[:, 6], tum_array[:, 7]
     quat_wxyz = np.stack([qw, qx, qy, qz], axis=1)
     return PoseTrajectory3D(positions_xyz=xyz, orientations_quat_wxyz=quat_wxyz, timestamps=t)
 
+
 def evo_traj_to_array(traj):
+    """Reverse of build_evo_trajectory() -- evo's PoseTrajectory3D back to
+    this project's Nx8 [t, tx, ty, tz, qx, qy, qz, qw] convention, e.g. after
+    align() has mutated the trajectory in place."""
     qw, qx, qy, qz = (traj.orientations_quat_wxyz[:, 0], traj.orientations_quat_wxyz[:, 1],
                        traj.orientations_quat_wxyz[:, 2], traj.orientations_quat_wxyz[:, 3])
     return np.column_stack([traj.timestamps, traj.positions_xyz, qx, qy, qz, qw])
+
+
+# ---------- depth: loading, backprojection ----------
 
 def find_depth_file(depth_dir, image_filename):
     stem = os.path.splitext(image_filename)[0]
@@ -75,10 +136,12 @@ def find_depth_file(depth_dir, image_filename):
             return p
     return None
 
+
 def load_depth_frame(path):
     if path.endswith(".npy"):
         return np.load(path).astype(np.float64)
     return np.array(Image.open(path)).astype(np.float64)
+
 
 def backproject_depth(depth, K, T_wc, min_depth=0.1, max_depth=20.0, max_points=None, rng=None):
     h, w = depth.shape
@@ -109,6 +172,11 @@ def main():
                      help="depth0 raw value -> meters (0.001 for 16-bit PNG, 1px=1mm)")
     ap.add_argument("--pred_depth_scale", type=float, default=1.0,
                      help="predicted .npy raw value -> meters (1.0 -- depth_infer.py already saves meters)")
+    ap.add_argument("--max_time_diff", type=float, default=0.02,
+                     help="max seconds between GT and estimated-pose timestamps to count as a "
+                          "match -- Isaac Sim datasets were tight sync (~ms), AirSim recordings "
+                          "have shown a constant ~80ms offset between IMU-clock GT and camera "
+                          "timestamps, so bump this up (e.g. 0.15) for those")
     ap.add_argument("--min_depth", type=float, default=0.1)
     ap.add_argument("--max_depth", type=float, default=50.0,
                      help="was 20.0 -- too low for aerial scenes where real (non-sentinel) "
@@ -154,9 +222,43 @@ def main():
 
     traj_ref = build_evo_trajectory(gt)
     traj_est = build_evo_trajectory(est)
-    traj_ref_sync, traj_est_sync = evo_sync.associate_trajectories(traj_ref, traj_est, max_diff=0.02)
+    traj_ref_sync, traj_est_sync = evo_sync.associate_trajectories(traj_ref, traj_est, max_diff=args.max_time_diff)
 
+    # Sim(3) for monocular VSLAM (unknown absolute scale), SE(3) otherwise.
+    # align() mutates traj_est_sync IN PLACE -- from here on its poses ARE
+    # the aligned ones, no manual R/t/s re-application needed anywhere below.
     r_align, t_align, s_align = traj_est_sync.align(traj_ref_sync, correct_scale=args.monocular)
+
+    # The GT trajectory in these datasets is a BODY pose, not a camera pose
+    # (verified: DPVO's own landmarks land 0.35m from the true surface once
+    # converted, 8.93m if not). A Sim(3) alignment matches POSITIONS and cannot
+    # absorb that, so ATE is unaffected but every RELATIVE metric is: the
+    # relative motion becomes a conjugation C^-1 dQ C, and for pure translation
+    # the error is |C^-1 t - t| -- i.e. a fixed fraction of the per-frame
+    # travel, reported as if it were VSLAM error. Re-express GT in the camera
+    # frame and re-measure.
+    # Preferred source: gt_frame.py, which decides the convention from the
+    # ground truth's OWN adjacent-frame consistency and therefore works even
+    # where the VSLAM trajectory has diverged (run1..run6, DPVO ATE 112-180 m).
+    R_bc = gt_frame.resolve(args.dataset_root)
+    if R_bc is not None:
+        C = R_bc.T
+        print(f"  [axis_fix] using the GT-self-consistency convention from gt_frame.py")
+        apply_fix = True
+    else:
+        C, res_after, res_before = estimate_axis_convention_fix(evo_traj_to_array(traj_ref_sync),
+                                                                evo_traj_to_array(traj_est_sync))
+        print(f"  [axis_fix] no cached convention; GT-vs-VSLAM offset "
+              f"{res_before:.2f} deg -> {res_after:.2f} deg")
+        apply_fix = res_after < 5.0 and res_before > 5.0
+    if apply_fix:
+        gt_cam = body_to_camera(load_gt_trajectory(gt_traj_path), C)
+        traj_ref = build_evo_trajectory(gt_cam)
+        traj_est = build_evo_trajectory(est)
+        traj_ref_sync, traj_est_sync = evo_sync.associate_trajectories(traj_ref, traj_est,
+                                                                        max_diff=args.max_time_diff)
+        r_align, t_align, s_align = traj_est_sync.align(traj_ref_sync, correct_scale=args.monocular)
+        print(f"  [axis_fix] GT re-expressed in the camera frame; metrics below are the corrected ones")
 
     ape = evo_metrics.APE(PoseRelation.translation_part)
     ape.process_data((traj_ref_sync, traj_est_sync))
@@ -183,7 +285,7 @@ def main():
     cam_w = load_camera_intrinsics(sensor_yaml_path)["width"]
     cam_h = load_camera_intrinsics(sensor_yaml_path)["height"]
     gt_m = evo_traj_to_array(traj_ref_sync)
-    est_m = evo_traj_to_array(traj_est_sync)  
+    est_m = evo_traj_to_array(traj_est_sync)  # already aligned (see above)
     gt_t, est_t = gt_m[:, 0], est_m[:, 0]
 
     idx_step = max(1, len(frames) // args.n_pointcloud_frames)
@@ -197,7 +299,7 @@ def main():
     for frame_t, fname in tqdm(chosen, desc="backprojecting"):
         j_gt = int(np.argmin(np.abs(gt_t - frame_t)))
         j_est = int(np.argmin(np.abs(est_t - frame_t)))
-        if abs(gt_t[j_gt] - frame_t) > 0.02 or abs(est_t[j_est] - frame_t) > 0.02:
+        if abs(gt_t[j_gt] - frame_t) > args.max_time_diff or abs(est_t[j_est] - frame_t) > args.max_time_diff:
             continue
 
         gt_depth_path = find_depth_file(gt_depth_dir, fname)
@@ -206,6 +308,8 @@ def main():
             continue
 
         gt_depth_raw = load_depth_frame(gt_depth_path)
+        # 65535 (uint16 max) is a "no return" sentinel (sky, etc.), not a real
+        # 65.5m measurement -- mask it explicitly, don't rely on max_depth alone
         gt_depth_raw = np.where(gt_depth_raw >= 65535, np.nan, gt_depth_raw)
         gt_depth = gt_depth_raw * args.gt_depth_scale
         pred_depth = load_depth_frame(pred_depth_path) * args.pred_depth_scale
@@ -213,18 +317,22 @@ def main():
             pred_depth = np.array(Image.fromarray(pred_depth.astype(np.float32))
                                    .resize((cam_w, cam_h), Image.BILINEAR))
 
+        # GT point cloud: GT depth through GT pose (no alignment needed, already in world frame)
         T_wc_gt = pose_row_to_T(gt_m[j_gt])
         gt_pts = backproject_depth(gt_depth, K, T_wc_gt, min_depth=args.min_depth,
                                     max_depth=args.max_depth,
                                     max_points=args.max_points_per_frame, rng=rng)
         gt_pts_all.append(gt_pts)
 
+        # Estimated point cloud: predicted depth through the estimated pose
+        # (already Sim(3)-aligned by evo above -- est_m holds aligned poses directly)
         T_wc_est = pose_row_to_T(est_m[j_est])
         est_pts = backproject_depth(pred_depth, K, T_wc_est, min_depth=args.min_depth,
                                      max_depth=args.max_depth,
                                      max_points=args.max_points_per_frame, rng=rng)
         est_pts_all.append(est_pts)
 
+        # per-frame depth error (same-pixel comparison, before backprojection)
         valid = (gt_depth > args.min_depth) & (gt_depth < args.max_depth) & np.isfinite(gt_depth)
         if valid.sum() > 0:
             depth_errors.append(float(np.mean(np.abs(pred_depth[valid] - gt_depth[valid]) / gt_depth[valid])))
@@ -240,7 +348,7 @@ def main():
     fig = go.Figure()
 
     gt_xyz = gt_m[:, 1:4]
-    est_xyz_aligned = est_m[:, 1:4] 
+    est_xyz_aligned = est_m[:, 1:4]  # already aligned by evo above
     fig.add_trace(go.Scatter3d(x=gt_xyz[:, 0], y=gt_xyz[:, 1], z=gt_xyz[:, 2],
                                 mode="lines", line=dict(color="black", width=5), name="GT trajectory"))
     fig.add_trace(go.Scatter3d(x=est_xyz_aligned[:, 0], y=est_xyz_aligned[:, 1], z=est_xyz_aligned[:, 2],
@@ -254,6 +362,8 @@ def main():
                                     mode="markers", marker=dict(size=1.5, color="orange", opacity=0.5),
                                     name="Estimated reconstruction (aligned)"))
 
+    # clip the initial view to the outlier-resistant bounding box -- see the
+    # earlier debugging session in this project for why this matters
     combined = np.concatenate([gt_xyz, est_xyz_aligned, gt_points, est_points], axis=0)
     lo, hi = np.percentile(combined, 1, axis=0), np.percentile(combined, 99, axis=0)
     span = np.maximum(hi - lo, 0.5)
@@ -280,6 +390,7 @@ def main():
             pass
         print("If a browser didn't open automatically: explorer.exe " + args.output)
 
+    # summary alongside the html, for your methodology writeup
     summary = {
         "vslam": vslam_name, "fde": fde_name,
         "ate_rmse_m": ate_rmse, "rte_rmse_m": rte_rmse, "rre_rmse_deg": rre_rmse,

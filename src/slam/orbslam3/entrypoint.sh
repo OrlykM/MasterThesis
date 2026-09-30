@@ -102,6 +102,18 @@ cp "$OUT_FILE" "$OUTPUT_DIR/poses.txt"
 cp /tmp/camera.yaml "$OUTPUT_DIR/camera.yaml"  # full settings file used, for exact reproducibility
 echo "Saved: $OUTPUT_DIR/poses.txt"
 
+# landmarks.txt -- per-frame tracked sparse map points (see
+# patch_landmarks_export.py), written to CWD (/ORB_SLAM3) by the patched
+# mono_euroc.cc. Used by depth_calibration.py to recalibrate FDE depth
+# against ORB-SLAM3's own sparse map, same role DPVO's dpvo_sparse_map.ply
+# already plays for the dpvo combos.
+if [ -f landmarks.txt ]; then
+    cp landmarks.txt "$OUTPUT_DIR/landmarks.txt"
+    echo "Saved: $OUTPUT_DIR/landmarks.txt ($(wc -l < landmarks.txt) tracked map-point observations)"
+else
+    echo "NOTE: no landmarks.txt produced -- depth calibration will be unavailable for this run"
+fi
+
 N_FRAMES=$(wc -l < /tmp/times.txt)
 cat > "$OUTPUT_DIR/run_config.json" <<EOF
 {
@@ -119,7 +131,7 @@ cat > "$OUTPUT_DIR/run_config.json" <<EOF
   },
   "n_frames_in_dataset": $N_FRAMES,
   "elapsed_seconds": $ELAPSED,
-  "known_limitation": "ORB-SLAM3 has no built-in point-cloud/map export (confirmed via upstream issue #390 -- trajectory export exists, map export does not). Only camera poses are available from this run, not ORB-SLAM3's internal sparse map.",
+  "known_limitation": "ORB-SLAM3 has no built-in FULL map export (confirmed via upstream issue #390). This build patches in per-frame tracked-point export instead (System::GetTrackedMapPoints(), a real existing API) -- see landmarks.txt alongside this file: it's the points matched in each tracked frame, not the complete map, but that's exactly what depth_calibration.py needs for scale calibration.",
   "timestamp": "$(date -Iseconds)"
 }
 EOF

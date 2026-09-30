@@ -1,3 +1,48 @@
+r"""
+Probabilistic occupancy fusion for VSLAM + FDE, with an ADAPTIVE reliability
+model (adaptive_grid) alongside two earlier, weaker baselines kept for
+comparison:
+
+  naive_grid    -- fixed +0.85/-0.4 log-odds regardless of confidence.
+  weighted_grid -- LEGACY: sigma(z)=a+b*z / sigma(d)=c+e*d curves fit
+                   OFFLINE against ground-truth depth (fit_error.py). Only
+                   built if --error_model is given. Kept for comparison, not
+                   because it's recommended: it needs GT depth (never
+                   available on a real flight) and the fit is frozen to
+                   whatever error pattern ONE dataset happened to have --
+                   plug in a new VSLAM/FDE pair or a new environment and
+                   it's silently wrong.
+  adaptive_grid -- the new default. Zero ground truth, zero pre-fit curves:
+                   * depth_calibration.LocalCalibrator recalibrates the
+                     dense FDE depth per-tile against the VSLAM's own
+                     sparse landmarks, with a kernel bandwidth set by the
+                     landmarks' own local spacing -- a sparse/degenerate
+                     region is automatically low-confidence, no hand-picked
+                     range cutoff.
+                   * depth_calibration.RunningScale replaces the fixed
+                     reference constants (old w_ref, consistency_tau) with
+                     an online estimate of whatever residual/disagreement
+                     magnitude THIS run is actually producing.
+                   Both adapt to whatever VSLAM+FDE+scene combination is
+                   running, instead of being tuned for one dataset.
+
+Note on metric scale: monocular VSLAM (no IMU fusion) has NO intrinsic
+metric scale -- any system built on it needs SOME external scale reference.
+Here that's the one-time Sim(3) fit to ground truth (a stand-in for what
+visual-inertial scale recovery would give for real); every dataset-specific
+GUESSWORK downstream of that (the error curves, the range cutoffs, the fixed
+weighting constants) is what's been replaced. Scale recovery itself is a
+separate, orthogonal problem (see mono-inertial VSLAM) -- out of scope here.
+
+Usage:
+    python3 occupancy_3d_map.py \
+        --dataset_root ~/MasterThesis/datasets/euroc/2026-04-01_..._quadrotor \
+        --vslam_dir ../../results/dpvo \
+        --fde_dir ../../results/zoedepth \
+        --output_dir maps/dpvo_zoedepth
+    (--error_model is optional now -- only needed to also get the legacy
+    weighted_grid for comparison.)
+"""
 import argparse
 import json
 import os
@@ -8,15 +53,23 @@ from PIL import Image
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from euroc_io import load_gt_trajectory, load_camera_intrinsics, load_image_timestamps, pose_row_to_T
+from euroc_io import (load_gt_trajectory, load_camera_intrinsics, load_image_timestamps, pose_row_to_T,
+                       estimate_axis_convention_fix)
 from compare_reconstruction_3d import (
     build_evo_trajectory, evo_traj_to_array, looks_like_frame_index, looks_like_raw_nanoseconds,
     remap_pseudo_timestamps, load_vslam_stride, load_tum, find_depth_file, load_depth_frame,
 )
 from evo.core import sync as evo_sync
+from udp_streaming import FrameReceiver, GridSender
+import depth_calibration as depth_calib
+import depth_refine
+import gt_frame
+import blade_mask as bm
 
 
 def eval_error_model(model, x):
+    """sigma(x) from a fitted model dict (linear or quadratic shape) -- only
+    used by the legacy weighted_grid path."""
     if model is None:
         return np.zeros_like(x) if hasattr(x, "shape") else 0.0
     a, b = model["a"], model["b"]
@@ -25,8 +78,47 @@ def eval_error_model(model, x):
     return a + b * x
 
 
+_KERNEL_OFFSET_CACHE = {}
+
+
+def _kernel_offsets(radius):
+    """All integer (dx, dy, dz) within `radius` voxels of the origin (a
+    ball, not a cube -- keeps the offset count down for larger radii) plus
+    their Euclidean distances. Cached: in practice there are only a handful
+    of distinct radii in play, since radius is itself derived from a small
+    set of similar sigma values seen over a run."""
+    radius = int(radius)
+    if radius not in _KERNEL_OFFSET_CACHE:
+        rng = np.arange(-radius, radius + 1)
+        dx, dy, dz = np.meshgrid(rng, rng, rng, indexing="ij")
+        offsets = np.stack([dx.ravel(), dy.ravel(), dz.ravel()], axis=1)
+        dist = np.linalg.norm(offsets, axis=1)
+        keep = dist <= radius + 1e-9
+        _KERNEL_OFFSET_CACHE[radius] = (offsets[keep], dist[keep])
+    return _KERNEL_OFFSET_CACHE[radius]
+
+
 class ProbabilisticVoxelGrid:
-    def __init__(self, bounds_min, bounds_max, resolution=0.5, l_occ_base=0.85, l_free_base=-0.4, l_min=-4.0, l_max=4.0):
+    """Log-odds occupancy grid where each point's contribution is scaled by
+    a per-point confidence weight, plus time-based decay toward unknown --
+    both missing from the naive baseline.
+
+    Also applies consistency weighting: an update that CONTRADICTS what the
+    grid already confidently believes about a voxel (from earlier passes) is
+    suppressed in proportion to how confident that prior belief was; an
+    update that CONFIRMS the prior gets full weight, and a fresh/unknown
+    voxel (log-odds ~0) is never suppressed either way. This is what gives
+    the map "memory" of previous passes over the same physical location.
+
+    consistency_tau may be a plain float (fixed, legacy behavior) OR a
+    depth_calibration.RunningScale instance -- when it's the latter, the
+    "how confident is confident" threshold self-calibrates from the actual
+    magnitude of prior beliefs this run has formed, instead of a constant
+    tuned for one dataset's log-odds dynamics."""
+
+    def __init__(self, bounds_min, bounds_max, resolution=0.5,
+                 l_occ_base=0.85, l_free_base=-0.4, l_min=-4.0, l_max=4.0,
+                 consistency_tau=2.0, use_consistency=True, sensor_model=None):
         self.origin = np.array(bounds_min, dtype=np.float64)
         self.resolution = resolution
         dims = np.ceil((np.array(bounds_max) - self.origin) / resolution).astype(int)
@@ -34,6 +126,24 @@ class ProbabilisticVoxelGrid:
         self.log_odds = np.zeros(self.dims, dtype=np.float32)
         self.l_occ_base, self.l_free_base = l_occ_base, l_free_base
         self.l_min, self.l_max = l_min, l_max
+        self.consistency_tau = consistency_tau
+        self.use_consistency = use_consistency
+        # When given a depth_calibration.MeasuredSensorModel, the log-odds
+        # increments stop being assumed constants and become measurements of
+        # how self-consistent THIS sensor chain actually is on THIS data.
+        self.sensor_model = sensor_model
+
+    @property
+    def _l_occ(self):
+        return self.sensor_model.l_occ if self.sensor_model is not None else self.l_occ_base
+
+    @property
+    def _l_free(self):
+        return self.sensor_model.l_free if self.sensor_model is not None else self.l_free_base
+
+    @property
+    def _tau(self):
+        return self.consistency_tau.value if hasattr(self.consistency_tau, "value") else self.consistency_tau
 
     def world_to_voxel(self, points):
         return np.floor((points - self.origin) / self.resolution).astype(int)
@@ -41,90 +151,447 @@ class ProbabilisticVoxelGrid:
     def _in_bounds(self, idx):
         return np.all((idx >= 0) & (idx < self.dims), axis=1)
 
-    def insert_weighted(self, points_world, weights, sensor_origin, n_ray_samples=4):
+    def _consistency_weight(self, l_prior, update_sign):
+        """update_sign: +1 for an occupied update, -1 for a free update.
+        Contradicts the prior -> weight shrinks with how confident the prior
+        was. Confirms the prior (or prior is ~0, i.e. unknown) -> full weight.
+        Also feeds the magnitude of touched (non-unknown) priors back into an
+        adaptive tau, if one was given."""
+        if hasattr(self.consistency_tau, "update"):
+            touched = np.abs(l_prior[np.abs(l_prior) > 1e-6])
+            if touched.size:
+                self.consistency_tau.update(float(np.median(touched)))
+        contradicts = (update_sign * l_prior) < 0
+        return np.where(contradicts, 1.0 / (1.0 + np.abs(l_prior) / self._tau), 1.0)
+
+    def insert_weighted(self, points_world, weights, sensor_origin, sigma=None, n_ray_samples=-1,
+                         splat_k_sigma=1.5, splat_max_radius_voxels=4, splat_occupied=False):
+        """sigma: optional per-point positional uncertainty (meters, same
+        length as points_world). When given, a point's OCCUPIED contribution
+        is spread with a Gaussian kernel over a neighborhood of radius
+        ceil(splat_k_sigma * sigma / resolution) voxels (capped at
+        splat_max_radius_voxels) instead of landing in a single voxel, with
+        weights normalized to sum to 1 -- the point injects the SAME total
+        evidence, just admits honestly where it might actually be instead of
+        planting it with false precision. This is what lets the map's
+        OVERLAP with the true surface survive positional uncertainty (VSLAM
+        drift, depth noise) that no amount of per-point CONFIDENCE weighting
+        alone can fix -- confidence changes how much a point counts, not
+        where it's allowed to land.
+
+        Free-space ray-casting deliberately does NOT get this treatment: it
+        stays a precise single-cell mark, so uncertainty can only ever make
+        the map admit MORE possible occupancy nearby, never erase real
+        occupancy by over-confidently clearing space around an uncertain
+        reading ("never lie about free space").
+
+        n_ray_samples: -1 (default) traverses each ray densely, one update
+        per voxel actually crossed. A positive value keeps the old fixed
+        sample count, for ablations."""
         if points_world.shape[0] == 0:
             return
+        # Snapshot taken BEFORE this frame's update -- every point/ray in this
+        # same call compares against the same prior, not a moving target as
+        # other pixels from this same frame get applied first.
+        snapshot = self.log_odds.reshape(-1).copy()
+        updated = snapshot.copy()
+
         occ_idx = self.world_to_voxel(points_world)
         mask = self._in_bounds(occ_idx)
-        occ_idx, w = occ_idx[mask], weights[mask]
-        if occ_idx.shape[0] > 0:
-            flat = np.ravel_multi_index(occ_idx.T, self.dims)
-            updated = self.log_odds.reshape(-1)
-            np.add.at(updated, flat, self.l_occ_base * w)
-            self.log_odds = np.clip(updated, self.l_min, self.l_max).reshape(self.dims)
+        occ_idx_v, w_occ = occ_idx[mask], weights[mask]
+        if occ_idx_v.shape[0] > 0:
+            if sigma is None or not splat_occupied:
+                flat_occ = np.ravel_multi_index(occ_idx_v.T, self.dims)
+                if self.sensor_model is not None:
+                    self.sensor_model.observe(snapshot[flat_occ], +1)
+                if self.use_consistency:
+                    w_occ = w_occ * self._consistency_weight(snapshot[flat_occ], +1)
+                np.add.at(updated, flat_occ, self._l_occ * w_occ)
+            else:
+                sigma_vox = np.maximum(sigma[mask], 0.0) / self.resolution
+                radius_vox = np.clip(np.ceil(splat_k_sigma * sigma_vox).astype(int), 0, splat_max_radius_voxels)
+                for r in np.unique(radius_vox):
+                    bucket = radius_vox == r
+                    base_idx, base_w = occ_idx_v[bucket], w_occ[bucket]
+                    base_sigma_vox = np.maximum(sigma_vox[bucket], 1e-6)
+                    offsets, dist = _kernel_offsets(r)
+                    kw = np.exp(-0.5 * (dist[None, :] / base_sigma_vox[:, None]) ** 2)
+                    kw = kw / np.maximum(kw.sum(axis=1, keepdims=True), 1e-12)
+                    all_idx = (base_idx[:, None, :] + offsets[None, :, :]).reshape(-1, 3)
+                    all_w = (base_w[:, None] * kw).reshape(-1)
+                    inb = self._in_bounds(all_idx)
+                    all_idx, all_w = all_idx[inb], all_w[inb]
+                    if all_idx.shape[0] == 0:
+                        continue
+                    flat = np.ravel_multi_index(all_idx.T, self.dims)
+                    if self.sensor_model is not None:
+                        self.sensor_model.observe(snapshot[flat], +1)
+                    if self.use_consistency:
+                        all_w = all_w * self._consistency_weight(snapshot[flat], +1)
+                    np.add.at(updated, flat, self._l_occ * all_w)
 
         pts = points_world[mask]
         w_masked = weights[mask]
-        if pts.shape[0] == 0 or n_ray_samples <= 0:
-            return
-        t = np.linspace(0.05, 0.92, n_ray_samples)
-        ray_pts = sensor_origin[None, None, :] + t[:, None, None] * (pts[None, :, :] - sensor_origin[None, None, :])
-        ray_w = np.tile(w_masked[None, :], (n_ray_samples, 1)).reshape(-1)
-        ray_pts = ray_pts.reshape(-1, 3)
-        free_idx = self.world_to_voxel(ray_pts)
-        fmask = self._in_bounds(free_idx)
-        free_idx, ray_w = free_idx[fmask], ray_w[fmask]
-        if free_idx.shape[0] > 0:
-            flat = np.ravel_multi_index(free_idx.T, self.dims)
-            updated = self.log_odds.reshape(-1)
-            np.add.at(updated, flat, self.l_free_base * ray_w)
-            self.log_odds = np.clip(updated, self.l_min, self.l_max).reshape(self.dims)
+        if pts.shape[0] > 0 and n_ray_samples != 0:
+            # DENSE traversal, not a fixed handful of samples: step along each
+            # ray at half a voxel so EVERY voxel it passes through gets its
+            # free-space update, the way occupancy mapping actually requires
+            # (cf. OctoMap). With the old fixed 4 samples, a 30m ray at 0.5m
+            # voxels marked 4 of ~60 traversed voxels free -- ~93% of the
+            # space we demonstrably saw through got no evidence at all, which
+            # is exactly what let phantom surfaces (an FDE predicting a
+            # finite depth for empty sky) survive in the map: nothing ever
+            # cleared them when a later frame looked straight through.
+            ray_vecs = pts - sensor_origin[None, :]
+            ray_lens = np.linalg.norm(ray_vecs, axis=1)
+            step = 0.5 * self.resolution
+            n_steps = int(np.clip(np.ceil(ray_lens.max() / step), 4, 4096)) if n_ray_samples < 0 \
+                else int(n_ray_samples)
+            t = np.linspace(0.05, 0.92, n_steps)
+            ray_pts = sensor_origin[None, None, :] + t[:, None, None] * ray_vecs[None, :, :]
+            n_pts = pts.shape[0]
+            point_ids = np.tile(np.arange(n_pts)[None, :], (n_steps, 1)).reshape(-1)
+            ray_w = np.tile(w_masked[None, :], (n_steps, 1)).reshape(-1)
+
+            # Stop carving free space k*sigma SHORT of the endpoint when a
+            # per-point uncertainty is known. With a fixed 92% cutoff and a
+            # depth estimate that's off by several meters, the ray punches
+            # straight through the real surface and erases it -- measured as
+            # the reason dense traversal HURT on real FDE output (it cleared
+            # true surfaces as fast as it cleared phantom ones). A point too
+            # uncertain to place at all (k*sigma >= its own range) carves
+            # nothing: "never lie about free space", now quantified.
+            keep_t = np.ones((n_steps, n_pts), dtype=bool)
+            if sigma is not None:
+                safe_len = ray_lens - splat_k_sigma * np.maximum(sigma[mask], 0.0)
+                t_max = np.clip(safe_len / np.maximum(ray_lens, 1e-9), 0.0, 0.92)
+                keep_t = t[:, None] <= t_max[None, :]
+            keep_flat = keep_t.reshape(-1)
+            ray_pts = ray_pts.reshape(-1, 3)[keep_flat]
+            point_ids = point_ids[keep_flat]
+            ray_w = ray_w[keep_flat]
+            if ray_pts.shape[0] == 0:
+                self.log_odds = np.clip(updated, self.l_min, self.l_max).reshape(self.dims)
+                return
+
+            free_idx = self.world_to_voxel(ray_pts)
+            fmask = self._in_bounds(free_idx)
+            free_idx_v, ray_w, point_ids = free_idx[fmask], ray_w[fmask], point_ids[fmask]
+            if free_idx_v.shape[0] > 0:
+                flat_free = np.ravel_multi_index(free_idx_v.T, self.dims)
+                # Oversampling means one ray can land in the same voxel many
+                # times; a ray must contribute ONE free update per voxel it
+                # traverses, not one per sample, or short rays would clear
+                # space far harder than long ones purely from step aliasing.
+                keys = point_ids.astype(np.int64) * int(np.prod(self.dims)) + flat_free
+                _, uniq = np.unique(keys, return_index=True)
+                flat_free, ray_w = flat_free[uniq], ray_w[uniq]
+                if self.sensor_model is not None:
+                    self.sensor_model.observe(snapshot[flat_free], -1)
+                if self.use_consistency:
+                    ray_w = ray_w * self._consistency_weight(snapshot[flat_free], -1)
+                np.add.at(updated, flat_free, self._l_free * ray_w)
+
+        self.log_odds = np.clip(updated, self.l_min, self.l_max).reshape(self.dims)
 
     def apply_decay(self, factor):
+        """Pulls all log-odds toward 0 (unknown) by `factor` in [0,1] -- call
+        once per frame/keyframe using a factor derived from your target
+        half-life: factor = 1 - 0.5**(dt / half_life). This is what keeps
+        the map LOCAL in time: old, no-longer-revisited evidence fades
+        instead of accumulating forever, bounding how far a single old
+        mistake (or a stretch of drift) can keep influencing the map."""
         self.log_odds *= (1.0 - factor)
 
     def occupied_mask(self, threshold=0.0):
         return self.log_odds > threshold
 
     def probability(self):
+        """log-odds -> probability, the actual 'ймовірнісна карта' from your
+        thesis title, not just a binary occupied/free grid."""
         return 1.0 / (1.0 + np.exp(-self.log_odds))
 
 
-def backproject_with_weights(depth, K, T_wc, sigma_pose_val, depth_model, min_depth, max_depth, max_points=None, rng=None, w_ref=1.0):
+def backproject_with_weight_map(depth, weight_map, K, T_wc, min_depth, max_depth,
+                                 max_points=None, rng=None, extra_maps=()):
+    """Shared backprojection core: depth and weight_map are both full (H, W)
+    images (weight_map broadcastable, e.g. a scalar-filled array or a
+    per-pixel confidence field from depth_calibration.LocalCalibrator).
+    extra_maps: additional (H, W) fields (e.g. a sigma map) to subsample
+    alongside depth/weight, at the SAME pixels/subsample indices -- returned
+    as extra positional arrays after weights, in the given order."""
     h, w = depth.shape
     d = depth.astype(np.float64)
-    valid = (d > min_depth) & (d < max_depth) & np.isfinite(d)
+    wm = np.broadcast_to(weight_map, d.shape)
+    valid = (d > min_depth) & (d < max_depth) & np.isfinite(d) & np.isfinite(wm)
     us, vs = np.meshgrid(np.arange(w), np.arange(h))
-    us, vs, d = us[valid], vs[valid], d[valid]
+    us, vs, d, weights = us[valid], vs[valid], d[valid], wm[valid]
+    extras = [np.broadcast_to(m, (h, w))[valid] for m in extra_maps]
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     x = (us - cx) * d / fx
     y = (vs - cy) * d / fy
     pts_cam = np.stack([x, y, d, np.ones_like(d)], axis=1)
 
-    sigma_depth_vals = eval_error_model(depth_model, d)
-    sigma_total = sigma_depth_vals + sigma_pose_val
-    weights = 1.0 / (1.0 + sigma_total / w_ref)
-
     if max_points is not None and pts_cam.shape[0] > max_points:
         rng = rng or np.random.default_rng()
         idx = rng.choice(pts_cam.shape[0], size=max_points, replace=False)
         pts_cam, weights = pts_cam[idx], weights[idx]
+        extras = [e[idx] for e in extras]
 
     pts_world = (T_wc @ pts_cam.T).T[:, :3]
+    if extra_maps:
+        return (pts_world, weights, *extras)
     return pts_world, weights
 
 
-def main():
+def legacy_weight_map(depth, sigma_pose_val, depth_model, w_ref):
+    """The OLD reliability model: fixed sigma(z)/sigma(d) curves fit offline
+    against ground truth. Kept only for the optional weighted_grid baseline."""
+    sigma_total = eval_error_model(depth_model, depth) + sigma_pose_val
+    return 1.0 / (1.0 + sigma_total / w_ref)
+
+
+def build_arg_parser():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset_root", required=True)
-    ap.add_argument("--vslam_dir", required=True)
-    ap.add_argument("--fde_dir", required=True)
-    ap.add_argument("--error_model", required=True, help="output of fit_error_models.py")
-    ap.add_argument("--output_dir", required=True)
-    ap.add_argument("--voxel_resolution", type=float, default=0.5)
-    ap.add_argument("--n_frames", type=int, default=80)
+    ap.add_argument("--mode", choices=["dataset", "udp"], default="dataset",
+                     help="'dataset' (default): read a pre-recorded EuRoC-style dataset. "
+                          "'udp': fuse frames arriving live over UDP instead, see "
+                          "FrameReceiver/GridSender in udp_streaming.py -- adaptive_grid isn't "
+                          "available here yet, since the wire protocol doesn't carry sparse "
+                          "VSLAM landmarks per frame")
+    ap.add_argument("--dataset_root", help="required in --mode dataset")
+    ap.add_argument("--vslam_dir", help="required in --mode dataset")
+    ap.add_argument("--fde_dir", help="required in --mode dataset")
+    ap.add_argument("--error_model", help="output of fit_error.py; OPTIONAL -- only builds the "
+                                           "legacy weighted_grid baseline for comparison. "
+                                           "adaptive_grid needs neither this nor ground truth.")
+    ap.add_argument("--output_dir", required=True,
+                     help="where naive_grid.npz/adaptive_grid.npz (and weighted_grid.npz if "
+                          "--error_model given) get written")
+    ap.add_argument("--max_time_diff", type=float, default=0.15,
+                     help="max seconds between GT and estimated-pose timestamps to count as a "
+                          "match -- AirSim recordings have a confirmed ~81ms GT/camera clock "
+                          "offset, Isaac Sim datasets can use the tighter 0.02")
+    ap.add_argument("--voxel_resolution", default="auto",
+                     help="metres per voxel, or 'auto' (default): set to the depth uncertainty "
+                          "the run MEASURES for itself (LocalCalibrator.residual_scale), times "
+                          "--voxel_per_sigma. Quantising an input 10x finer than its own "
+                          "precision is what made the map look like noise: measured IoU rose "
+                          "monotonically 0.0128 -> 0.0615 as the voxel grew 0.5m -> 4m on data "
+                          "with ~5m depth residual.")
+    ap.add_argument("--n_frames", type=int, default=80, help="--mode dataset only")
     ap.add_argument("--max_points_per_frame", type=int, default=4000)
     ap.add_argument("--gt_depth_scale", type=float, default=0.001)
     ap.add_argument("--pred_depth_scale", type=float, default=1.0)
     ap.add_argument("--min_depth", type=float, default=0.1)
-    ap.add_argument("--max_depth", type=float, default=50.0)
-    ap.add_argument("--w_ref", type=float, default=1.0, help="reference uncertainty (meters) at which weight drops to 0.5 -- tune this against your error model's own scale")
-    args = ap.parse_args()
+    ap.add_argument("--max_depth", default="auto",
+                     help="metres, or 'auto' (default): the 95th percentile of the depths at "
+                          "which this run's own sparse VSLAM landmarks actually appear. Beyond "
+                          "that range nothing anchors the depth, so it cannot be calibrated or "
+                          "trusted -- and the figure comes from the VSLAM itself, needing no "
+                          "ground truth and no knowledge of the scene's scale.")
+    ap.add_argument("--w_ref", type=float, default=1.0,
+                     help="legacy weighted_grid only: reference uncertainty (meters) at which "
+                          "weight drops to 0.5")
+    ap.add_argument("--consistency_tau", type=float, default=2.0,
+                     help="naive/legacy weighted_grid only: fixed prior-resistance threshold. "
+                          "adaptive_grid always uses a self-calibrating RunningScale instead")
+    ap.add_argument("--no_consistency", action="store_true",
+                     help="ablation: disable prior-consistency weighting everywhere")
+    ap.add_argument("--no_adaptive_grid", action="store_true",
+                     help="skip adaptive_grid entirely (e.g. to only get naive/weighted)")
+    ap.add_argument("--calib_model", choices=["scale", "affine"], default="scale",
+                     help="per-tile depth correction: 'scale' is z'=s*z with s the kernel-weighted "
+                          "MEDIAN ratio (one parameter, robust by construction -- the primary "
+                          "model agreed in docs/chat_context.md 7.2); 'affine' is alpha*z+beta "
+                          "with Huber IRLS and shrinkage toward a robust frame-level prior, kept "
+                          "as the comparison variant.")
+    ap.add_argument("--calib_tile_px", type=int, default=40,
+                     help="adaptive_grid: image-space tile size (pixels) for local depth "
+                          "recalibration -- a structural resolution choice, not a per-dataset "
+                          "fit; scales naturally with image resolution")
+    ap.add_argument("--calib_k_neighbors", type=int, default=12,
+                     help="adaptive_grid: how many nearest sparse VSLAM landmarks each tile's "
+                          "local fit uses -- a COUNT, not a metric-space radius, so it stays "
+                          "meaningful regardless of scene scale")
+    ap.add_argument("--anchor_window_frames", default="off",
+                     help="restrict the calibration to landmarks belonging to +/- this many frames "
+                          "of the current one (each landmark assigned to its nearest trajectory "
+                          "pose) instead of the whole merged DPVO cloud. 'off' (default) uses the "
+                          "whole cloud, because windowing was MEASURED not to help: +/-20 frames "
+                          "gives IoU 0.013, +/-100 gives 0.120, the whole cloud 0.152, and "
+                          "'auto' (max_depth / per-frame travel, i.e. +/-458 here) gives 0.155 -- "
+                          "within noise of just using everything. The reason is geometric: a point "
+                          "seen now at 50m was triangulated from poses 50m BEHIND, so a tight "
+                          "window cuts away exactly the observations that constrain it.")
+    ap.add_argument("--calib_min_anchors_total", type=int, default=8,
+                     help="adaptive_grid: minimum sparse landmarks visible anywhere in a frame "
+                          "before it's skipped entirely (never fabricate a calibration from "
+                          "near-nothing)")
+    ap.add_argument("--baseline_frames", type=int, default=10,
+                     help="with --max_depth auto: how many frames of camera travel count as the "
+                          "triangulation baseline (a COUNT -- roughly the VSLAM's own window)")
+    ap.add_argument("--rel_depth_tol", type=float, default=0.1,
+                     help="with --max_depth auto: the relative depth accuracy that still counts "
+                          "as usable (0.1 = 10%%). Dimensionless.")
+    ap.add_argument("--sigma_pix", type=float, default=1.0,
+                     help="with --max_depth auto: assumed feature localisation noise in pixels "
+                          "-- a property of the detector, not of the scene")
+    ap.add_argument("--voxel_per_sigma", type=float, default=1.0,
+                     help="with --voxel_resolution auto: voxel = this x measured depth "
+                          "uncertainty. 1.0 = 'quantise at the noise level', the standard rule; "
+                          "it is a dimensionless ratio, so it carries across scene scales.")
+    ap.add_argument("--pose_drift_rate", type=float, default=0.005,
+                     help="adaptive_grid: assumed monocular-VO drift as a fraction of distance "
+                          "traveled (no GT, no loop closure possible on a one-way flight -- "
+                          "well-tuned monocular VO/VIO without loop closure typically drifts on "
+                          "the order of 0.3-1%% of distance traveled; this is a literature-typical "
+                          "engineering default, NOT fit to this dataset's own ground truth, "
+                          "unlike the old sigma_pose(d) curve -- it was sanity-checked against "
+                          "this run's OWN measured ATE/distance ratio (~0.25%%) only to confirm "
+                          "the order of magnitude is reasonable, the same way you'd sanity-check "
+                          "a Kalman filter's assumed process noise, not fit a curve to it). Feeds "
+                          "the position-uncertainty splat radius below, not a per-dataset calibration.")
+    ap.add_argument("--axis_fix", choices=["auto", "off"], default="auto",
+                     help="correct a camera-axis CONVENTION mismatch between the VSLAM's poses "
+                          "and the dataset's frame. A Sim(3) trajectory alignment matches "
+                          "positions only and cannot absorb this, so ATE looks fine while every "
+                          "backprojection points the wrong way: measured as a constant 120 deg "
+                          "offset here, which alone collapsed occupancy IoU to 0.0005 even with "
+                          "PERFECT depth. 'auto' snaps it to the nearest of the 24 signed axis "
+                          "permutations (a discrete convention choice, identical for DPVO and "
+                          "ORB-SLAM3 on this data) and reports the residual so a genuinely "
+                          "diverged trajectory is visible instead of silently patched.")
+    ap.add_argument("--max_anchor_gap", type=float, default=0.0,
+                     help="adaptive_grid: drop pixels whose nearest sparse VSLAM landmark is "
+                          "further than this MULTIPLE of the run's own typical anchor spacing "
+                          "(relative, not a pixel/metre constant). 0 = disabled, which is the "
+                          "default because it was MEASURED counterproductive: it was meant to "
+                          "reject sky (24-48%% of every frame, where the depth network invents a "
+                          "surface), but DPVO's sparse cloud projects degenerate far points INTO "
+                          "the sky region, so the gate cut real structure faster than phantoms "
+                          "(IoU 0.0233 -> 0.0088 as it tightened). Kept for the ORB-SLAM3 "
+                          "per-frame landmark source, where anchor support is honest.")
+    ap.add_argument("--blade_mask", default="../masks/blades_airsim.npz",
+                     help="drop the drone's own propellers (blade_mask.py) from EVERY variant and "
+                          "from the GT reference -- they are part of the aircraft, not the scene. "
+                          "Empty/absent mask = no effect (e.g. the Isaac Sim dataset has none).")
+    ap.add_argument("--depth_net",
+                     help="path to a depth_net.py checkpoint. Order per frame: FDE -> network "
+                          "(refined depth, sigma_net, p_surface) -> drop p_surface < "
+                          "--net_min_surface -> the per-tile VSLAM calibration still runs as a "
+                          "safety net -> if the refined depth disagrees with the VSLAM landmarks "
+                          "by more than --net_reject_k times the run's own residual scale, the "
+                          "frame is fused WITHOUT the network. Applied to EVERY variant so the "
+                          "comparison stays fair.")
+    ap.add_argument("--net_min_surface", type=float, default=0.5,
+                     help="with --depth_net: drop pixels the network says hold no surface")
+    ap.add_argument("--net_reject_k", type=float, default=3.0,
+                     help="with --depth_net: fall back to the statistical path when the network "
+                          "disagrees with the VSLAM landmarks by more than this many residual scales")
+    ap.add_argument("--depth_refiner",
+                     help="path to a depth_refine.py table (learned on OTHER sequences) that "
+                          "corrects this FDE model's in-domain bias and rejects pixels where a "
+                          "surface rarely exists at all (sky). Ground truth is used to TRAIN it, "
+                          "never at inference -- same status as the depth network's own training.")
+    ap.add_argument("--refiner_min_validity", type=float, default=0.5,
+                     help="with --depth_refiner: drop pixels whose cell had a real surface less "
+                          "often than this in training")
+    ap.add_argument("--measured_sensor_model", action="store_true",
+                     help="replace the assumed +0.85/-0.4 log-odds increments with ones measured "
+                          "from how self-consistent this sensor chain proves to be. OFF by "
+                          "default because it was MEASURED not to help: a systematically biased "
+                          "depth source AGREES WITH ITSELF, so the measured p_occ pegs at its "
+                          "0.95 ceiling and the map ends up MORE confident, not less (IoU 0.416 "
+                          "-> 0.388 on dav2). Self-consistency cannot see systematic error -- "
+                          "the same limit that makes accumulation unable to average such error "
+                          "away. Kept because it becomes the right thing to do the moment the "
+                          "depth source's errors are actually independent between frames.")
+    ap.add_argument("--splat", action="store_true",
+                     help="adaptive_grid: spread each point's occupied evidence over a "
+                          "neighborhood sized by its uncertainty. OFF by default because the "
+                          "controlled-noise ablation (noise_ablation.py) measured it as clearly "
+                          "HARMFUL at an occupancy threshold of P>0.5: normalizing the mass over "
+                          "N voxels still leaves every one of them above zero log-odds, so it "
+                          "acts as pure dilation (IoU 0.42 -> 0.18 on clean input). It only "
+                          "starts to make sense paired with a much higher read-out threshold.")
+    ap.add_argument("--splat_k_sigma", type=float, default=1.5,
+                     help="adaptive_grid: a point's OCCUPIED evidence is spread over a "
+                          "neighborhood of ceil(this * sigma / voxel_resolution) voxels instead "
+                          "of landing in one voxel -- sigma combines depth-calibration residual "
+                          "and pose-drift uncertainty. Free-space rays are never spread (see "
+                          "ProbabilisticVoxelGrid.insert_weighted).")
+    ap.add_argument("--splat_max_radius_voxels", type=int, default=4,
+                     help="adaptive_grid: hard cap on the splat radius above, so a wildly "
+                          "uncertain point still costs bounded compute instead of smearing "
+                          "across the whole grid")
+    ap.add_argument("--n_ray_samples", type=int, default=4,
+                     help="free-space ray sampling: N samples per ray, or -1 to traverse every "
+                          "voxel the ray crosses. Dense (-1) is what occupancy mapping is "
+                          "supposed to do, but it was MEASURED slightly worse here even with "
+                          "uncertainty-limited carving, because a depth estimate off by several "
+                          "meters makes each extra sample another chance to erase a real "
+                          "surface; revisit this once depth error drops.")
+    ap.add_argument("--gt_compare", action="store_true",
+                     help="evaluation-only, --mode dataset: also backproject GT depth (via GT "
+                          "poses, dataset_root/depth0/) into a reference grid on the SAME voxel "
+                          "bounds, and report occupancy IoU/FPVR of naive/weighted/adaptive "
+                          "against it -- the metric that actually reflects the THRESHOLDED "
+                          "probabilistic map, unlike evaluation.py's raw per-point IoU which "
+                          "never exercises the log-odds fusion (weights, splatting) at all")
 
+    udp = ap.add_argument_group("--mode udp")
+    udp.add_argument("--listen_host", default="0.0.0.0", help="address to receive frames on")
+    udp.add_argument("--listen_port", type=int, default=9000, help="port to receive frames on")
+    udp.add_argument("--bounds_min", type=float, nargs=3, metavar=("X", "Y", "Z"),
+                      help="voxel grid lower corner (world coords, meters) -- required for "
+                           "--mode udp since the grid must be allocated before any points "
+                           "arrive, unlike --mode dataset which sizes it from all points upfront")
+    udp.add_argument("--bounds_max", type=float, nargs=3, metavar=("X", "Y", "Z"),
+                      help="voxel grid upper corner, see --bounds_min")
+    udp.add_argument("--sensor_yaml", help="EuRoC sensor.yaml for camera intrinsics, used when "
+                                            "incoming frames don't carry their own K")
+    udp.add_argument("--send_host", help="if set, forward each frame's voxel grid to this "
+                                          "address -- separate from --listen_host/--listen_port, "
+                                          "so input frames and output maps can go to/from "
+                                          "different machines")
+    udp.add_argument("--send_port", type=int, default=9001)
+    udp.add_argument("--send_grid", choices=["naive", "weighted", "both"], default="weighted")
+    udp.add_argument("--send_every", type=int, default=1, help="forward the grid every Nth "
+                                                                 "received frame, to save bandwidth")
+    udp.add_argument("--max_frames", type=int, default=None, help="stop after this many frames "
+                                                                    "(default: run until Ctrl+C)")
+    udp.add_argument("--idle_timeout", type=float, default=None,
+                      help="stop if no frame arrives for this many seconds (default: never)")
+    udp.add_argument("--checkpoint_every", type=int, default=200,
+                      help="also write naive_grid.npz/weighted_grid.npz to --output_dir every "
+                           "N frames, not just on exit")
+    udp.add_argument("--decay_half_life", type=float, default=None,
+                      help="if set, pull log-odds toward unknown once per frame with this "
+                           "half-life in seconds (uses each frame's own timestamp gap)")
+    return ap
+
+
+def grey_for_net(args, fname, cam_h, cam_w):
+    """Greyscale frame at the dataset's own resolution, for the network's image
+    and gradient channels."""
+    path = os.path.join(args.dataset_root, "cam0", "data", fname)
+    img = np.array(Image.open(path).convert("L")).astype(np.float32) / 255.0
+    if img.shape != (cam_h, cam_w):
+        img = np.array(Image.fromarray(img).resize((cam_w, cam_h), Image.BILINEAR))
+    return img
+
+
+def run_dataset_mode(args):
     os.makedirs(args.output_dir, exist_ok=True)
-    with open(args.error_model) as f:
-        err = json.load(f)
-    pose_model, depth_model = err["pose_model"], err["depth_model"]
+    if not (args.dataset_root and args.vslam_dir and args.fde_dir):
+        raise SystemExit("--mode dataset requires --dataset_root, --vslam_dir and --fde_dir")
+
+    pose_model = depth_model = None
+    if args.error_model:
+        with open(args.error_model) as f:
+            err = json.load(f)
+        pose_model, depth_model = err["pose_model"], err["depth_model"]
 
     gt_traj_path = os.path.join(args.dataset_root, "state_groundtruth_estimate0", "data.csv")
     cam_csv_path = os.path.join(args.dataset_root, "cam0", "data.csv")
@@ -142,31 +609,126 @@ def main():
         est = est.copy()
         est[:, 0] = est[:, 0] / 1e9
 
+    # The ONE remaining use of ground truth: recovering monocular VSLAM's
+    # missing metric scale (a stand-in for what visual-inertial fusion would
+    # give on a real flight -- see module docstring). Nothing downstream of
+    # this (the reliability weighting, the depth recalibration) touches GT.
     traj_ref = build_evo_trajectory(gt)
     traj_est = build_evo_trajectory(est)
-    traj_ref_sync, traj_est_sync = evo_sync.associate_trajectories(traj_ref, traj_est, max_diff=0.02)
-    traj_est_sync.align(traj_ref_sync, correct_scale=True)
+    traj_ref_sync, traj_est_sync = evo_sync.associate_trajectories(traj_ref, traj_est, max_diff=args.max_time_diff)
+    r_a, t_a, s_a = traj_est_sync.align(traj_ref_sync, correct_scale=True)
     gt_m = evo_traj_to_array(traj_ref_sync)
     est_m = evo_traj_to_array(traj_est_sync)
     gt_t, est_t = gt_m[:, 0], est_m[:, 0]
+
+    R_axis_fix = np.eye(3)
+    if args.axis_fix == "auto":
+        R_bc_cached = gt_frame.resolve(args.dataset_root)
+        if R_bc_cached is not None:
+            R_axis_fix = R_bc_cached.T
+            print("[axis_fix] using the GT-self-consistency convention from gt_frame.py")
+            res_after = res_before = float("nan")
+        else:
+            R_axis_fix, res_after, res_before = estimate_axis_convention_fix(gt_m, est_m)
+            print(f"[axis_fix] GT poses are body-frame: camera<->body offset {res_before:.2f} deg -> "
+                  f"{res_after:.2f} deg residual after snapping to the nearest axis permutation "
+                  f"(applied to the GT reference, not to the VSLAM poses)")
+        if res_after == res_after and res_after > 5.0:
+            print(f"[axis_fix] WARNING residual {res_after:.2f} deg is too large to be a pure "
+                  f"convention offset -- this VSLAM run's orientations genuinely diverged, so "
+                  f"the map will be wrong no matter what the fusion layer does")
 
     K = load_camera_intrinsics(sensor_yaml_path)["K"]
     cam_w = load_camera_intrinsics(sensor_yaml_path)["width"]
     cam_h = load_camera_intrinsics(sensor_yaml_path)["height"]
 
-    xyz = gt_m[:, 1:4]
+    xyz = est_m[:, 1:4]
     seg_lengths = np.linalg.norm(np.diff(xyz, axis=0), axis=1)
-    cum_dist = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+    cum_dist = np.concatenate([[0.0], np.cumsum(seg_lengths)])  # from the ESTIMATE, not GT
 
     idx_step = max(1, len(frames) // args.n_frames)
     chosen = frames[::idx_step][:args.n_frames]
     rng = np.random.default_rng(0)
 
-    all_pts, all_weights, all_pts_naive = [], [], []
+    blades = None
+    if args.blade_mask and os.path.exists(args.blade_mask):
+        blades = bm.load_mask(args.blade_mask, shape=(cam_h, cam_w))
+        if blades.sum() == 0:
+            blades = None
+        else:
+            print(f"[blade_mask] excluding {int(blades.sum())} px/frame from EVERY variant")
+
+    refiner = depth_refine.load_refiner(args.depth_refiner) if args.depth_refiner else None
+    if refiner is not None:
+        print(f"[refiner] loaded {args.depth_refiner}")
+
+    net_refiner = None
+    if args.depth_net:
+        import depth_net_infer
+        net_refiner = depth_net_infer.NetRefiner(args.depth_net)
+        print(f"[depth_net] {net_refiner}")
+
+    anchors = None
+    local_calib = None
+    if not args.no_adaptive_grid:
+        anchors = depth_calib.SparseMapAnchors.from_vslam_dir(args.vslam_dir)
+        if anchors is None:
+            print(f"[adaptive] no landmarks.txt or dpvo_sparse_map.ply in {args.vslam_dir} -- "
+                  f"adaptive_grid will be skipped for this run")
+        else:
+            anchors.points = depth_calib.sim3_transform(anchors.points, r_a, t_a, s_a)
+            local_calib = depth_calib.LocalCalibrator(
+                tile_px=args.calib_tile_px, k_neighbors=args.calib_k_neighbors,
+                min_anchors_total=args.calib_min_anchors_total, model=args.calib_model)
+
+    # ---- --max_depth auto: from triangulation geometry, not from the cloud ----
+    # Depth from triangulation has sigma_z ~ z^2 * sigma_pix / (f * B), so the
+    # range where depth is meaningful at all is z_max = rel_tol * f * B /
+    # sigma_pix. Everything here is measurable without ground truth: f from
+    # the intrinsics, B from how far the camera actually travels across the
+    # VSLAM's own window, sigma_pix a feature-localisation constant. Taking a
+    # percentile of the landmark cloud instead does NOT work: monocular VO
+    # clouds are dominated by near-zero-parallax points whose depth is
+    # unconstrained (median 121m, tail past 20km on this 227m-long scene), so
+    # the cloud reports its own garbage back as "range".
+    if isinstance(args.max_depth, str):
+        if args.max_depth != "auto":
+            args.max_depth = float(args.max_depth)
+        else:
+            xyz_est = est_m[:, 1:4]
+            per_frame = np.linalg.norm(np.diff(xyz_est, axis=0), axis=1)
+            baseline = float(np.median(per_frame)) * args.baseline_frames
+            f = float((K[0, 0] + K[1, 1]) / 2.0)
+            args.max_depth = max(args.rel_depth_tol * f * baseline / args.sigma_pix, 1.0)
+            print(f"[auto] max_depth = {args.max_depth:.1f}m (triangulation limit: "
+                  f"{args.rel_depth_tol:.0%} depth accuracy at f={f:.0f}px over a "
+                  f"{baseline:.2f}m baseline)")
+
+    # Landmark -> frame association, now that max_depth is a number: a point
+    # visible at range R was triangulated from poses up to R behind us.
+    if anchors is not None:
+        if isinstance(args.anchor_window_frames, str) and args.anchor_window_frames != "off":
+            if args.anchor_window_frames == "auto":
+                per_frame = float(np.median(np.linalg.norm(np.diff(est_m[:, 1:4], axis=0), axis=1)))
+                args.anchor_window_frames = int(np.clip(args.max_depth / max(per_frame, 1e-6),
+                                                        20, len(est_m)))
+                print(f"[auto] anchor_window = +/-{args.anchor_window_frames} frames "
+                      f"({args.max_depth:.0f}m range / {per_frame:.3f}m per frame)")
+            else:
+                args.anchor_window_frames = int(args.anchor_window_frames)
+        if args.anchor_window_frames != "off":
+            anchors.attach_trajectory(est_m[:, 0], est_m[:, 1:4],
+                                       window_frames=int(args.anchor_window_frames))
+
+    gt_depth_dir = os.path.join(args.dataset_root, "depth0", "data")
+    all_pts, all_weights, all_origins = [], [], []
+    all_pts_w, all_weights_w = [], []
+    all_pts_a, all_weights_a, all_sigma_a, all_origins_a = [], [], [], []
+    all_pts_gt, all_origins_gt = [], []
     for frame_t, fname in tqdm(chosen, desc="fusing"):
         j_gt = int(np.argmin(np.abs(gt_t - frame_t)))
         j_est = int(np.argmin(np.abs(est_t - frame_t)))
-        if abs(gt_t[j_gt] - frame_t) > 0.02 or abs(est_t[j_est] - frame_t) > 0.02:
+        if abs(gt_t[j_gt] - frame_t) > args.max_time_diff or abs(est_t[j_est] - frame_t) > args.max_time_diff:
             continue
         pred_path = find_depth_file(fde_dir_full, fname)
         if pred_path is None:
@@ -176,44 +738,335 @@ def main():
             pred_depth = np.array(Image.fromarray(pred_depth.astype(np.float32)).resize((cam_w, cam_h), Image.BILINEAR))
 
         T_wc = pose_row_to_T(est_m[j_est])
-        sigma_pose_val = float(eval_error_model(pose_model, np.array([cum_dist[j_gt]]))[0])
+        origin = T_wc[:3, 3]
 
-        pts, w = backproject_with_weights(pred_depth, K, T_wc, sigma_pose_val, depth_model,
-                                           args.min_depth, args.max_depth,
-                                           max_points=args.max_points_per_frame, rng=rng, w_ref=args.w_ref)
+        if args.gt_compare:
+            gt_depth_path = find_depth_file(gt_depth_dir, fname)
+            if gt_depth_path is not None:
+                gt_depth_raw = load_depth_frame(gt_depth_path)
+                gt_depth_raw = np.where(gt_depth_raw >= 65535, np.nan, gt_depth_raw)
+                gt_depth = gt_depth_raw * args.gt_depth_scale
+                if blades is not None:
+                    gt_depth = np.where(blades, np.nan, gt_depth)
+                T_wc_gt = pose_row_to_T(gt_m[j_gt])
+                T_wc_gt[:3, :3] = T_wc_gt[:3, :3] @ R_axis_fix.T  # GT is a BODY pose
+                pts_gt, _ = backproject_with_weight_map(gt_depth, np.ones_like(gt_depth), K, T_wc_gt,
+                                                         args.min_depth, args.max_depth,
+                                                         max_points=args.max_points_per_frame, rng=rng)
+                all_pts_gt.append(pts_gt)
+                all_origins_gt.append(T_wc_gt[:3, 3])
+
+        # The network runs first and, like the table below, before every
+        # variant, so switching it on is a clean comparison rather than a
+        # change only the adaptive path sees.
+        net_sigma = None
+        if net_refiner is not None:
+            au0, av0, az0 = (np.zeros(0), np.zeros(0), np.zeros(0))
+            if anchors is not None:
+                au0, av0, az0 = depth_calib.project_points(
+                    anchors.for_frame(est_m[j_est, 0]), T_wc, K, cam_w, cam_h,
+                    args.min_depth, args.max_depth)
+            out = net_refiner.refine(pred_depth, grey_for_net(args, fname, cam_h, cam_w),
+                                      au0, av0, az0, args.min_depth)
+            if out is not None:
+                refined, sigma_m, p_surf = out
+                scale = local_calib.residual_scale.value if local_calib is not None else np.nan
+                if net_refiner.disagrees_with_anchors(refined, au0, av0, az0, scale,
+                                                       args.net_reject_k):
+                    pass  # too far from the landmarks -- keep the raw FDE depth
+                else:
+                    pred_depth = refined
+                    net_sigma = sigma_m
+                    net_keep = p_surf >= args.net_min_surface
+                    pred_depth = np.where(net_keep, pred_depth, np.nan)
+
+        # Applied BEFORE every variant, so "with refiner" vs "without" is a
+        # clean 2x2 against naive/adaptive rather than a change only one of
+        # them sees.
+        refine_keep = None
+        if refiner is not None:
+            pred_depth, refine_keep = depth_refine.apply_refiner(
+                refiner, pred_depth, min_validity=args.refiner_min_validity)
+
+        naive_wm = np.ones_like(pred_depth)
+        if blades is not None:
+            naive_wm = np.where(blades, np.nan, naive_wm)
+        if refine_keep is not None:
+            naive_wm = np.where(refine_keep, naive_wm, np.nan)
+        pts, w = backproject_with_weight_map(pred_depth, naive_wm, K, T_wc,
+                                              args.min_depth, args.max_depth,
+                                              max_points=args.max_points_per_frame, rng=rng)
         all_pts.append(pts)
         all_weights.append(w)
-        all_pts_naive.append((pts, T_wc[:3, 3]))
+        all_origins.append(origin)
+
+        if pose_model is not None or depth_model is not None:
+            sigma_pose_val = float(eval_error_model(pose_model, np.array([cum_dist[j_est]]))[0])
+            wm = legacy_weight_map(pred_depth, sigma_pose_val, depth_model, args.w_ref)
+            if blades is not None:
+                wm = np.where(blades, np.nan, wm)
+            pts_w, w_w = backproject_with_weight_map(pred_depth, wm, K, T_wc, args.min_depth, args.max_depth,
+                                                      max_points=args.max_points_per_frame, rng=rng)
+            all_pts_w.append(pts_w)
+            all_weights_w.append(w_w)
+
+        if local_calib is not None:
+            frame_anchors = anchors.for_frame(est_m[j_est, 0])
+            au, av, az = depth_calib.project_points(frame_anchors, T_wc, K, cam_w, cam_h,
+                                                      args.min_depth, args.max_depth)
+            result = local_calib.calibrate_frame(au, av, az, pred_depth)
+            if result is not None:
+                alpha_map, beta_map, conf_map, sigma_depth_map, support_map = result
+                if blades is not None:
+                    conf_map = np.where(blades, np.nan, conf_map)
+                if refine_keep is not None:
+                    conf_map = np.where(refine_keep, conf_map, np.nan)
+                if args.max_anchor_gap > 0:
+                    # NaN weight => backproject_with_weight_map drops the pixel
+                    # outright. Down-weighting isn't enough: at P>0.5 any
+                    # positive weight still marks the voxel occupied.
+                    conf_map = np.where(support_map > args.max_anchor_gap, np.nan, conf_map)
+                # Pose-drift term: no GT, no loop closure possible on a
+                # one-way flight -- see --pose_drift_rate. Added (not just
+                # max'd) with the depth-side sigma since they're independent
+                # error sources compounding the same positional uncertainty.
+                sigma_pose_val = args.pose_drift_rate * cum_dist[j_est]
+                sigma_map = sigma_depth_map + sigma_pose_val
+                if net_sigma is not None:
+                    # independent error sources on the same quantity
+                    sigma_map = np.sqrt(sigma_map ** 2 + net_sigma ** 2)
+                    scale = max(local_calib.residual_scale.value, 1e-6)
+                    conf_map = 1.0 / (1.0 + sigma_map / scale)
+                corrected = np.clip(alpha_map * pred_depth + beta_map, 0.0, None)
+                pts_a, w_a, sig_a = backproject_with_weight_map(
+                    corrected, conf_map, K, T_wc, args.min_depth, args.max_depth,
+                    max_points=args.max_points_per_frame, rng=rng, extra_maps=(sigma_map,))
+                all_pts_a.append(pts_a)
+                all_weights_a.append(w_a)
+                all_sigma_a.append(sig_a)
+                all_origins_a.append(origin)
 
     points = np.concatenate(all_pts, axis=0) if all_pts else np.zeros((0, 3))
     weights = np.concatenate(all_weights, axis=0) if all_weights else np.zeros(0)
     print(f"\nTotal points: {len(points)}, weight range: [{weights.min():.3f}, {weights.max():.3f}]"
           if len(weights) else "No points backprojected.")
 
+    if local_calib is not None:
+        print(f"[adaptive] {local_calib.summary()}")
+    if net_refiner is not None:
+        print(f"[depth_net] {net_refiner.summary()}")
+
     if len(points) == 0:
         print("Nothing to save.")
         return
 
-    bounds_min = points.min(axis=0) - 1.0
-    bounds_max = points.max(axis=0) + 1.0
+    points_a = np.concatenate(all_pts_a, axis=0) if all_pts_a else np.zeros((0, 3))
+    weights_a = np.concatenate(all_weights_a, axis=0) if all_weights_a else np.zeros(0)
+    bounds_src = np.concatenate([p for p in (points, points_a) if len(p)], axis=0)
+    if isinstance(args.voxel_resolution, str):
+        if args.voxel_resolution != "auto":
+            args.voxel_resolution = float(args.voxel_resolution)
+        elif local_calib is not None and local_calib.n_frames_calibrated > 0:
+            args.voxel_resolution = float(args.voxel_per_sigma * local_calib.residual_scale.value)
+            print(f"[auto] voxel_resolution = {args.voxel_resolution:.2f}m "
+                  f"({args.voxel_per_sigma} x the {local_calib.residual_scale.value:.2f}m depth "
+                  f"uncertainty this run measured for itself)")
+            span = float(np.max(bounds_src.max(axis=0) - bounds_src.min(axis=0)))
+            if args.voxel_resolution > span / 20.0:
+                print(f"[auto] WARNING that voxel is coarser than 1/20th of the {span:.0f}m scene "
+                      f"-- this depth source is too inaccurate to map this environment at any "
+                      f"useful resolution, and no fusion setting will change that")
+        else:
+            args.voxel_resolution = 0.5
+            print("[auto] no calibration to measure uncertainty from -- falling back to 0.5m")
 
+    points_gt = np.concatenate(all_pts_gt, axis=0) if all_pts_gt else np.zeros((0, 3))
+    bounds_src = np.concatenate([p for p in (points, points_a, points_gt) if len(p)], axis=0)
+    bounds_min = bounds_src.min(axis=0) - 1.0
+    bounds_max = bounds_src.max(axis=0) + 1.0
+
+    # ---------- naive baseline: fixed log-odds, no weighting ----------
     naive_grid = ProbabilisticVoxelGrid(bounds_min, bounds_max, args.voxel_resolution)
-    for pts, origin in all_pts_naive:
-        naive_grid.insert_weighted(pts, np.ones(len(pts)), origin)
+    for pts, origin in zip(all_pts, all_origins):
+        naive_grid.insert_weighted(pts, np.ones(len(pts)), origin, n_ray_samples=args.n_ray_samples)
 
-    weighted_grid = ProbabilisticVoxelGrid(bounds_min, bounds_max, args.voxel_resolution)
-    offset = 0
-    for pts, origin in all_pts_naive:
-        n = len(pts)
-        weighted_grid.insert_weighted(pts, weights[offset:offset + n], origin)
-        offset += n
+    # ---------- legacy formula-based weighting, only if --error_model given ----------
+    weighted_grid = None
+    if all_pts_w:
+        weighted_grid = ProbabilisticVoxelGrid(
+            bounds_min, bounds_max, args.voxel_resolution,
+            consistency_tau=args.consistency_tau, use_consistency=not args.no_consistency)
+        for pts_w, w_w, origin in zip(all_pts_w, all_weights_w, all_origins):
+            weighted_grid.insert_weighted(pts_w, w_w, origin, n_ray_samples=args.n_ray_samples)
 
-    np.savez_compressed(os.path.join(args.output_dir, "naive_grid.npz"), log_odds=naive_grid.log_odds, origin=naive_grid.origin, resolution=naive_grid.resolution)
-    np.savez_compressed(os.path.join(args.output_dir, "weighted_grid.npz"), log_odds=weighted_grid.log_odds, origin=weighted_grid.origin, resolution=weighted_grid.resolution)
+    # ---------- adaptive: local depth recalibration + self-calibrating confidence ----------
+    adaptive_grid = None
+    if len(points_a) > 0:
+        sensor_model = depth_calib.MeasuredSensorModel() if args.measured_sensor_model else None
+        adaptive_grid = ProbabilisticVoxelGrid(
+            bounds_min, bounds_max, args.voxel_resolution,
+            consistency_tau=depth_calib.RunningScale(init=args.consistency_tau, half_life=30),
+            use_consistency=not args.no_consistency, sensor_model=sensor_model)
+        for pts_a, w_a, sig_a, origin in zip(all_pts_a, all_weights_a, all_sigma_a, all_origins_a):
+            adaptive_grid.insert_weighted(pts_a, w_a, origin, sigma=sig_a,
+                                           n_ray_samples=args.n_ray_samples,
+                                           splat_k_sigma=args.splat_k_sigma,
+                                           splat_max_radius_voxels=args.splat_max_radius_voxels,
+                                           splat_occupied=args.splat)
 
+    if args.gt_compare and len(points_gt) > 0:
+        # Reference = "which voxels contain a true surface", so no free-space
+        # ray-casting here (n_ray_samples=0): GT rays grazing along a wall
+        # would otherwise erode the very surfaces the reference is supposed
+        # to define, shrinking the ground truth itself by ~2x.
+        gt_grid = ProbabilisticVoxelGrid(bounds_min, bounds_max, args.voxel_resolution)
+        for pts_gt, origin in zip(all_pts_gt, all_origins_gt):
+            gt_grid.insert_weighted(pts_gt, np.ones(len(pts_gt)), origin, n_ray_samples=0)
+        gt_mask = gt_grid.occupied_mask()
+        print(f"\n[gt_compare] GT occupied voxels: {int(gt_mask.sum())}")
+        # Swept over the occupancy threshold, because log_odds>0 (the old
+        # single fixed report) is a threshold ANY single observation clears:
+        # one glancing low-confidence hit marked a voxel occupied forever.
+        # The point of a PROBABILISTIC map is that a voxel re-confirmed from
+        # many viewpoints outranks one seen once -- which only shows up if
+        # you actually require accumulated evidence.
+        thresholds = [0.0, 0.85, 1.7, 2.55, 3.4]
+        for label, grid in (("naive", naive_grid), ("weighted (legacy)", weighted_grid), ("adaptive", adaptive_grid)):
+            if grid is None:
+                continue
+            print(f"[gt_compare] {label}:")
+            for thr in thresholds:
+                pred_mask = grid.occupied_mask(threshold=thr)
+                tp = int(np.logical_and(gt_mask, pred_mask).sum())
+                fp = int(np.logical_and(~gt_mask, pred_mask).sum())
+                fn = int(np.logical_and(gt_mask, ~pred_mask).sum())
+                union = tp + fp + fn
+                iou = tp / union if union > 0 else 0.0
+                n_occ = int(pred_mask.sum())
+                fpvr = fp / n_occ if n_occ > 0 else 0.0
+                prec = tp / n_occ if n_occ > 0 else 0.0
+                rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                prob = 1.0 / (1.0 + np.exp(-thr))
+                print(f"[gt_compare]   thr={thr:4.2f} (P>{prob:.2f}): IoU={iou:.4f} FPVR={fpvr:.4f} "
+                      f"prec={prec:.4f} rec={rec:.4f}  occ={n_occ:7d} TP={tp:6d} FP={fp:8d} FN={fn:6d}")
+    elif args.gt_compare:
+        print("\n[gt_compare] requested but no GT depth frames matched -- skipped")
+
+    save_grids(args.output_dir, naive_grid, weighted_grid, adaptive_grid)
+    print(f"Naive occupied voxels:    {int(naive_grid.occupied_mask().sum())}")
+    if weighted_grid is not None:
+        print(f"Weighted occupied voxels: {int(weighted_grid.occupied_mask().sum())} (legacy)")
+    if adaptive_grid is not None:
+        if adaptive_grid.sensor_model is not None:
+            print(f"[sensor_model] measured from self-consistency: "
+                  f"{adaptive_grid.sensor_model.summary()} (assumed would be "
+                  f"l_occ=0.85, l_free=-0.4)")
+        print(f"Adaptive occupied voxels: {int(adaptive_grid.occupied_mask().sum())}")
+    print(f"Saved to: {args.output_dir}/")
+
+
+def save_grids(output_dir, naive_grid, weighted_grid=None, adaptive_grid=None):
+    os.makedirs(output_dir, exist_ok=True)
+    np.savez_compressed(os.path.join(output_dir, "naive_grid.npz"),
+                         log_odds=naive_grid.log_odds, origin=naive_grid.origin, resolution=naive_grid.resolution)
+    if weighted_grid is not None:
+        np.savez_compressed(os.path.join(output_dir, "weighted_grid.npz"),
+                             log_odds=weighted_grid.log_odds, origin=weighted_grid.origin,
+                             resolution=weighted_grid.resolution)
+    if adaptive_grid is not None:
+        np.savez_compressed(os.path.join(output_dir, "adaptive_grid.npz"),
+                             log_odds=adaptive_grid.log_odds, origin=adaptive_grid.origin,
+                             resolution=adaptive_grid.resolution)
+
+
+def run_udp_mode(args):
+    if args.bounds_min is None or args.bounds_max is None:
+        raise SystemExit("--mode udp requires --bounds_min X Y Z and --bounds_max X Y Z -- "
+                          "the grid has to be allocated before any frames arrive")
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    pose_model = depth_model = None
+    if args.error_model:
+        with open(args.error_model) as f:
+            err = json.load(f)
+        pose_model, depth_model = err["pose_model"], err["depth_model"]
+
+    K_default = load_camera_intrinsics(args.sensor_yaml)["K"] if args.sensor_yaml else None
+
+    naive_grid = ProbabilisticVoxelGrid(args.bounds_min, args.bounds_max, args.voxel_resolution)
+    weighted_grid = ProbabilisticVoxelGrid(
+        args.bounds_min, args.bounds_max, args.voxel_resolution,
+        consistency_tau=args.consistency_tau, use_consistency=not args.no_consistency)
+
+    receiver = FrameReceiver(args.listen_host, args.listen_port)
+    sender = GridSender(args.send_host, args.send_port) if args.send_host else None
+    print(f"[udp] listening for frames on {args.listen_host}:{args.listen_port}")
+    if sender:
+        print(f"[udp] forwarding '{args.send_grid}' grid every {args.send_every} frame(s) "
+              f"to {args.send_host}:{args.send_port}")
+
+    n_received = 0
+    prev_timestamp = None
+    try:
+        for frame in receiver.frames(idle_timeout=args.idle_timeout):
+            K = frame["K"] if frame["K"] is not None else K_default
+            if K is None:
+                print("[udp] skipping frame: no camera intrinsics (frame carried none and "
+                      "--sensor_yaml not given)")
+                continue
+
+            depth = frame["depth"] * args.pred_depth_scale
+            T_wc = frame["T_wc"]
+            sigma_pose_val = float(eval_error_model(pose_model, np.array([frame["pose_x"]]))[0])
+            wm = legacy_weight_map(depth, sigma_pose_val, depth_model, args.w_ref)
+            pts, w = backproject_with_weight_map(depth, np.ones_like(depth), K, T_wc,
+                                                  args.min_depth, args.max_depth,
+                                                  max_points=args.max_points_per_frame)
+            pts_w, w_w = backproject_with_weight_map(depth, wm, K, T_wc, args.min_depth, args.max_depth,
+                                                      max_points=args.max_points_per_frame)
+            naive_grid.insert_weighted(pts, w, T_wc[:3, 3])
+            weighted_grid.insert_weighted(pts_w, w_w, T_wc[:3, 3])
+
+            if args.decay_half_life and prev_timestamp is not None:
+                dt = max(0.0, frame["timestamp"] - prev_timestamp)
+                factor = 1.0 - 0.5 ** (dt / args.decay_half_life)
+                naive_grid.apply_decay(factor)
+                weighted_grid.apply_decay(factor)
+            prev_timestamp = frame["timestamp"]
+
+            n_received += 1
+            if sender and n_received % args.send_every == 0:
+                if args.send_grid in ("naive", "both"):
+                    sender.send_grid(frame["frame_id"], naive_grid, kind="naive")
+                if args.send_grid in ("weighted", "both"):
+                    sender.send_grid(frame["frame_id"], weighted_grid, kind="weighted")
+
+            if args.checkpoint_every and n_received % args.checkpoint_every == 0:
+                save_grids(args.output_dir, naive_grid, weighted_grid)
+
+            if args.max_frames and n_received >= args.max_frames:
+                print(f"[udp] reached --max_frames {args.max_frames}, stopping")
+                break
+    except KeyboardInterrupt:
+        print("\n[udp] stopped (Ctrl+C)")
+    finally:
+        receiver.close()
+        if sender:
+            sender.close()
+
+    save_grids(args.output_dir, naive_grid, weighted_grid)
+    print(f"[udp] fused {n_received} frames")
     print(f"Naive occupied voxels:    {int(naive_grid.occupied_mask().sum())}")
     print(f"Weighted occupied voxels: {int(weighted_grid.occupied_mask().sum())}")
     print(f"Saved: {args.output_dir}/naive_grid.npz, weighted_grid.npz")
+
+
+def main():
+    args = build_arg_parser().parse_args()
+    if args.mode == "dataset":
+        run_dataset_mode(args)
+    else:
+        run_udp_mode(args)
 
 
 if __name__ == "__main__":
