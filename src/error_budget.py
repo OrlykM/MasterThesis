@@ -48,6 +48,8 @@ def main():
     ap.add_argument("--max_depth", type=float, default=50.0)
     ap.add_argument("--max_time_diff", type=float, default=0.15)
     ap.add_argument("--axis_fix", choices=["auto", "off"], default="auto")
+    ap.add_argument("--depth_refiner", help="adds a 'refined depth + GT pose' row")
+    ap.add_argument("--depth_net", help="adds a 'network depth + GT pose' row")
     args = ap.parse_args()
 
     gt = load_gt_trajectory(os.path.join(args.dataset_root, "state_groundtruth_estimate0", "data.csv"))
@@ -75,6 +77,15 @@ def main():
     step = max(1, len(frames) // args.n_frames)
     combos = {"GT depth  + GT pose ": [], "GT depth  + EST pose": [],
               "FDE depth + GT pose ": [], "FDE depth + EST pose": []}
+    refiner = net_refiner = None
+    if args.depth_refiner:
+        import depth_refine
+        refiner = depth_refine.load_refiner(args.depth_refiner)
+        combos["refined    + GT pose "] = []
+    if args.depth_net:
+        import depth_net_infer
+        net_refiner = depth_net_infer.NetRefiner(args.depth_net)
+        combos["network    + GT pose "] = []
 
     for frame_t, fname in tqdm(frames[::step][:args.n_frames], desc="error budget", leave=False):
         jg = int(np.argmin(np.abs(gt_t - frame_t)))
@@ -93,16 +104,35 @@ def main():
         T_gt, T_est = pose_row_to_T(gt_m[jg]), pose_row_to_T(est_m[je])
         T_gt[:3, :3] = T_gt[:3, :3] @ R_axis_fix.T  # GT is a BODY pose, convert to camera
 
-        for label, (depth, T) in {
+        variants = {
             "GT depth  + GT pose ": (d_gt, T_gt),
             "GT depth  + EST pose": (d_gt, T_est),
             "FDE depth + GT pose ": (d_fde, T_gt),
             "FDE depth + EST pose": (d_fde, T_est),
-        }.items():
+        }
+        if refiner is not None:
+            import depth_refine
+            d_ref, keep = depth_refine.apply_refiner(refiner, d_fde)
+            variants["refined    + GT pose "] = (np.where(keep, d_ref, np.nan), T_gt)
+        if net_refiner is not None:
+            from PIL import Image as _Image
+            ip = os.path.join(args.dataset_root, "cam0", "data", fname)
+            grey = np.array(_Image.open(ip).convert("L")).astype(np.float32) / 255.0
+            # sparse support taken from the GT depth itself here, so this row
+            # isolates the network's depth quality from VSLAM landmark quality
+            vs_, us_ = np.nonzero(np.isfinite(d_gt) & (d_gt > args.min_depth))
+            sel = np.random.default_rng(0).choice(len(us_), min(400, len(us_)), replace=False)
+            out = net_refiner.refine(d_fde, grey, us_[sel].astype(float), vs_[sel].astype(float),
+                                      d_gt[vs_[sel], us_[sel]], args.min_depth)
+            if out is not None:
+                d_net, _sig, p_surf = out
+                variants["network    + GT pose "] = (np.where(p_surf >= 0.5, d_net, np.nan), T_gt)
+
+        for label, (depth, T) in variants.items():
             pts, _ = backproject_with_weight_map(depth, np.ones_like(depth), K, T,
                                                   args.min_depth, args.max_depth,
                                                   max_points=args.max_points_per_frame, rng=rng)
-            combos[label].append((pts, T[:3, 3]))
+            combos.setdefault(label, []).append((pts, T[:3, 3]))
 
     allp = np.concatenate([p for v in combos.values() for p, _ in v], axis=0)
     bmin, bmax = allp.min(axis=0) - 1.0, allp.max(axis=0) + 1.0
@@ -120,6 +150,8 @@ def main():
     print(f"{'configuration':22s} {'IoU':>8s} {'FPVR':>8s} {'precision':>10s} {'recall':>8s} "
           f"{'vs random':>10s}")
     for label, entries in combos.items():
+        if not entries:
+            continue
         m = build(entries, 4)
         tp = int(np.logical_and(ref, m).sum())
         fp = int(np.logical_and(~ref, m).sum())

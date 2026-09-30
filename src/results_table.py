@@ -37,7 +37,8 @@ def dataset_root(name):
     return DATASET_ROOTS.get(name, f"../datasets/{name}")
 
 
-def run_once(dataset, vslam, fde, resolution, refiner, out_dir, n_frames, max_time_diff):
+def run_once(dataset, vslam, fde, resolution, refiner, out_dir, n_frames, max_time_diff,
+              net=None):
     """Builds naive+adaptive for one configuration and returns the two grids."""
     argv = ["--mode", "dataset",
             "--dataset_root", dataset_root(dataset),
@@ -49,6 +50,8 @@ def run_once(dataset, vslam, fde, resolution, refiner, out_dir, n_frames, max_ti
             "--max_time_diff", str(max_time_diff)]
     if refiner:
         argv += ["--depth_refiner", refiner]
+    if net:
+        argv += ["--depth_net", net]
     args = om.build_arg_parser().parse_args(argv)
     om.run_dataset_mode(args)
     grids = {}
@@ -65,6 +68,7 @@ def main():
     ap.add_argument("--fdes", nargs="+", default=["zoedepth", "depthanythingv2", "fastdepth"])
     ap.add_argument("--resolutions", type=float, nargs="+", default=[1.0, 0.5])
     ap.add_argument("--refiner_dir", default="../refiners")
+    ap.add_argument("--net_dir", default="../nets")
     ap.add_argument("--work_dir", default="/tmp/results_table")
     ap.add_argument("--output", required=True)
     ap.add_argument("--n_frames", type=int, default=80)
@@ -72,6 +76,8 @@ def main():
     ap.add_argument("--threshold", type=float, default=0.0)
     ap.add_argument("--gt_frames", type=int, default=60)
     args = ap.parse_args()
+    # checkpoints are named <short>_holdout_<dataset>.pt
+    args.net_prefix = {"zoedepth": "zoe", "depthanythingv2": "dav2", "fastdepth": "fast"}
 
     rows = []
     for dataset in args.datasets:
@@ -80,8 +86,11 @@ def main():
         for fde in args.fdes:
             refiner = os.path.join(args.refiner_dir, f"loo_{dataset}_{fde}.npz")
             if not os.path.exists(refiner):
-                print(f"!! no held-out refiner for {dataset}/{fde} -- skipping the 'with' column")
+                print(f"!! no held-out refiner for {dataset}/{fde} -- skipping that column")
                 refiner = None
+            net = os.path.join(args.net_dir, f"{args.net_prefix.get(fde, fde)}_holdout_{dataset}.pt")
+            if not os.path.exists(net):
+                net = None
 
             # The pipeline's own choice, reported but not used for comparison
             auto_dir = os.path.join(args.work_dir, f"{dataset}_{fde}_auto")
@@ -94,15 +103,22 @@ def main():
                 row = {"dataset": dataset, "vslam": args.vslam, "fde": fde,
                        "voxel_m": resolution, "auto_voxel_m": round(auto_res, 2),
                        "auto_max_depth_m": round(auto_max_depth, 1)}
-                for label, ref in (("raw", None), ("refined", refiner)):
-                    if ref is None and label == "refined":
+                # Three depth sources, each giving both a baseline and an
+                # adaptive map -> the five-variant table of stage 3.3:
+                #   raw      baseline / adaptive on the FDE depth as it comes
+                #   refined  the same two with the depth_refine table
+                #   net      the same two with the network
+                for label, (ref, nt) in (("raw", (None, None)),
+                                          ("refined", (refiner, None)),
+                                          ("net", (None, net))):
+                    if label == "refined" and ref is None or label == "net" and nt is None:
                         for key in ("naive", "adaptive"):
-                            row[f"iou_{key}_{label}"] = None
-                            row[f"fpvr_{key}_{label}"] = None
+                            for m in ("iou", "fpvr", "prec", "rec"):
+                                row[f"{m}_{key}_{label}"] = None
                         continue
                     out_dir = os.path.join(args.work_dir, f"{dataset}_{fde}_{resolution}_{label}")
                     grids, _ = run_once(dataset, args.vslam, fde, resolution, ref, out_dir,
-                                         args.n_frames, args.max_time_diff)
+                                         args.n_frames, args.max_time_diff, net=nt)
                     ref_grid = grids["naive"] if grids["naive"] is not None else grids["adaptive"]
                     if ref_grid is None:
                         continue
@@ -124,20 +140,22 @@ def main():
                 rows.append(row)
                 print(f"\n== {dataset} / {args.vslam}+{fde} @ {resolution}m "
                       f"(auto would be {auto_res:.2f}m) ==")
-                print(f"{'':10s} {'IoU raw':>9s} {'IoU refined':>12s} {'FPVR raw':>10s} {'FPVR refined':>13s}")
+                def f(v):
+                    return f"{v:.4f}" if isinstance(v, float) else "    -   "
+                print(f"{'variant':20s} {'IoU':>8s} {'FPVR':>8s} {'prec':>8s} {'rec':>8s}")
                 for key in ("naive", "adaptive"):
-                    def f(v):
-                        return f"{v:.4f}" if isinstance(v, float) else "   -  "
-                    print(f"{key:10s} {f(row.get(f'iou_{key}_raw')):>9s} "
-                          f"{f(row.get(f'iou_{key}_refined')):>12s} "
-                          f"{f(row.get(f'fpvr_{key}_raw')):>10s} "
-                          f"{f(row.get(f'fpvr_{key}_refined')):>13s}")
+                    for label in ("raw", "refined", "net"):
+                        name = {"naive": "baseline", "adaptive": "adaptive"}[key]
+                        extra = {"raw": "", "refined": " + table", "net": " + net"}[label]
+                        print(f"{name + extra:20s} {f(row.get(f'iou_{key}_{label}')):>8s} "
+                              f"{f(row.get(f'fpvr_{key}_{label}')):>8s} "
+                              f"{f(row.get(f'prec_{key}_{label}')):>8s} "
+                              f"{f(row.get(f'rec_{key}_{label}')):>8s}")
 
-    headers = ["dataset", "vslam", "fde", "voxel_m", "auto_voxel_m", "auto_max_depth_m", "gt_occupied",
-               "iou_naive_raw", "iou_naive_refined", "iou_adaptive_raw", "iou_adaptive_refined",
-               "fpvr_naive_raw", "fpvr_naive_refined", "fpvr_adaptive_raw", "fpvr_adaptive_refined",
-               "prec_naive_raw", "prec_naive_refined", "prec_adaptive_raw", "prec_adaptive_refined",
-               "rec_naive_raw", "rec_naive_refined", "rec_adaptive_raw", "rec_adaptive_refined"]
+    headers = (["dataset", "vslam", "fde", "voxel_m", "auto_voxel_m", "auto_max_depth_m",
+                "gt_occupied"]
+               + [f"{m}_{k}_{l}" for m in ("iou", "fpvr", "prec", "rec")
+                  for k in ("naive", "adaptive") for l in ("raw", "refined", "net")])
     with open(args.output, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
         w.writeheader()

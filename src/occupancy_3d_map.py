@@ -817,15 +817,20 @@ def run_dataset_mode(args):
             result = local_calib.calibrate_frame(au, av, az, pred_depth)
             if result is not None:
                 alpha_map, beta_map, conf_map, sigma_depth_map, support_map = result
+
+                # Every reason to reject a pixel is collected into ONE mask and
+                # applied last. Applying them to conf_map as we go would be
+                # undone by the network branch below, which recomputes conf from
+                # the combined sigma -- that silently cancelled the blade mask
+                # and the table's sky rejection whenever --depth_net was on.
+                drop = np.zeros(pred_depth.shape, dtype=bool)
                 if blades is not None:
-                    conf_map = np.where(blades, np.nan, conf_map)
+                    drop |= blades
                 if refine_keep is not None:
-                    conf_map = np.where(refine_keep, conf_map, np.nan)
+                    drop |= ~refine_keep
                 if args.max_anchor_gap > 0:
-                    # NaN weight => backproject_with_weight_map drops the pixel
-                    # outright. Down-weighting isn't enough: at P>0.5 any
-                    # positive weight still marks the voxel occupied.
-                    conf_map = np.where(support_map > args.max_anchor_gap, np.nan, conf_map)
+                    drop |= support_map > args.max_anchor_gap
+
                 # Pose-drift term: no GT, no loop closure possible on a
                 # one-way flight -- see --pose_drift_rate. Added (not just
                 # max'd) with the depth-side sigma since they're independent
@@ -837,6 +842,11 @@ def run_dataset_mode(args):
                     sigma_map = np.sqrt(sigma_map ** 2 + net_sigma ** 2)
                     scale = max(local_calib.residual_scale.value, 1e-6)
                     conf_map = 1.0 / (1.0 + sigma_map / scale)
+
+                # NaN weight => backproject_with_weight_map drops the pixel
+                # outright. Down-weighting is not enough: at a read-out of
+                # P>0.5 any positive weight still marks the voxel occupied.
+                conf_map = np.where(drop, np.nan, conf_map)
                 corrected = np.clip(alpha_map * pred_depth + beta_map, 0.0, None)
                 pts_a, w_a, sig_a = backproject_with_weight_map(
                     corrected, conf_map, K, T_wc, args.min_depth, args.max_depth,
