@@ -24,6 +24,14 @@ def main():
     ap.add_argument("--max_points", type=int, default=200000,
                      help="subsample if more occupied voxels than this, keeps the browser responsive")
     ap.add_argument("--no_open", action="store_true")
+    ap.add_argument("--show_free", action="store_true",
+                     help="also draw the voxels the map is confident are EMPTY (P below "
+                          "--free_threshold), in cool colours. The occupied half alone does not "
+                          "show whether the map actually knows where there is nothing.")
+    ap.add_argument("--free_threshold", type=float, default=0.25,
+                     help="with --show_free: P(occupied) below this counts as confidently free")
+    ap.add_argument("--trajectory", help="optional state_groundtruth_estimate0/data.csv to draw "
+                                          "the flight path alongside the map, for scale")
     args = ap.parse_args()
 
     print(f"Завантаження карти: {args.map_file}...")
@@ -49,7 +57,35 @@ def main():
     else:
         print(f"  {n} зайнятих вокселів")
 
-    fig = go.Figure(go.Scatter3d(
+    traces = []
+    if args.show_free:
+        free_mask = (1.0 / (1.0 + np.exp(-log_odds))) < args.free_threshold
+        fidx = np.argwhere(free_mask)
+        if len(fidx):
+            fpts = origin + (fidx * resolution) + (resolution / 2.0)
+            if len(fpts) > args.max_points:
+                rng2 = np.random.default_rng(1)
+                fpts = fpts[rng2.choice(len(fpts), args.max_points, replace=False)]
+            print(f"  {int(free_mask.sum())} впевнено вільних вокселів (P < {args.free_threshold})")
+            traces.append(go.Scatter3d(
+                x=fpts[:, 0], y=fpts[:, 1], z=fpts[:, 2], mode="markers",
+                marker=dict(size=2, color="rgba(90,160,255,0.25)"), name="вільно"))
+
+    if args.trajectory:
+        import csv as _csv
+        xyz = []
+        with open(args.trajectory) as f:
+            for row in _csv.reader(f):
+                try:
+                    xyz.append([float(row[1]), float(row[2]), float(row[3])])
+                except (ValueError, IndexError):
+                    continue
+        if xyz:
+            xyz = np.array(xyz)
+            traces.append(go.Scatter3d(x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2], mode="lines",
+                                        line=dict(color="lime", width=4), name="траєкторія"))
+
+    traces.append(go.Scatter3d(
         x=points_world[:, 0], y=points_world[:, 1], z=points_world[:, 2],
         mode="markers",
         marker=dict(
@@ -57,8 +93,9 @@ def main():
             cmin=0.5, cmax=1.0, opacity=0.85,
             colorbar=dict(title="P(occupied)"),
         ),
-        name="occupancy",
+        name="зайнято",
     ))
+    fig = go.Figure(traces)
 
     lo, hi = points_world.min(axis=0), points_world.max(axis=0)
     span = np.maximum(hi - lo, 0.5)

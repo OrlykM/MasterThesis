@@ -226,3 +226,5 @@ chat_context.md
 cache/
 # Trained checkpoints -- rebuild with depth_net.py train
 nets/
+maps/*/*/prob2d/
+logs/

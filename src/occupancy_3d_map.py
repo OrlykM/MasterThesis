@@ -65,6 +65,7 @@ import depth_calibration as depth_calib
 import depth_refine
 import gt_frame
 import blade_mask as bm
+import sky_cue
 
 
 def eval_error_model(model, x):
@@ -373,23 +374,40 @@ def build_arg_parser():
                           "match -- AirSim recordings have a confirmed ~81ms GT/camera clock "
                           "offset, Isaac Sim datasets can use the tighter 0.02")
     ap.add_argument("--voxel_resolution", default="auto",
-                     help="metres per voxel, or 'auto' (default): set to the depth uncertainty "
+                     help="metres per voxel, 'auto' (default) or 'fine'. 'fine' is the finest "
+                          "voxel that fits --max_grid_voxels, floored at --min_voxel: it makes "
+                          "the map look like a reconstruction rather than a handful of blocks, "
+                          "at the cost of quantising the depth far finer than its own measured "
+                          "precision, so its IoU is LOWER. Use 'auto' for the metrics and 'fine' "
+                          "for the pictures. 'auto': set to the depth uncertainty "
                           "the run MEASURES for itself (LocalCalibrator.residual_scale), times "
                           "--voxel_per_sigma. Quantising an input 10x finer than its own "
                           "precision is what made the map look like noise: measured IoU rose "
                           "monotonically 0.0128 -> 0.0615 as the voxel grew 0.5m -> 4m on data "
                           "with ~5m depth residual.")
+    ap.add_argument("--max_grid_voxels", type=float, default=100e6,
+                     help="with --voxel_resolution fine: how many voxels one grid may hold. "
+                          "Three grids are built (naive, adaptive, GT reference) at 4 bytes a "
+                          "voxel, so 100M is ~1.2 GB in total -- chosen for the 10 GB this WSL "
+                          "has, not for any dataset.")
+    ap.add_argument("--min_voxel", type=float, default=1.0,
+                     help="with --voxel_resolution fine: never go finer than this, whatever the "
+                          "budget allows. 1 m is roughly the size of the obstacles this map is "
+                          "meant to warn about.")
     ap.add_argument("--n_frames", type=int, default=80, help="--mode dataset only")
     ap.add_argument("--max_points_per_frame", type=int, default=4000)
     ap.add_argument("--gt_depth_scale", type=float, default=0.001)
     ap.add_argument("--pred_depth_scale", type=float, default=1.0)
     ap.add_argument("--min_depth", type=float, default=0.1)
     ap.add_argument("--max_depth", default="auto",
-                     help="metres, or 'auto' (default): the 95th percentile of the depths at "
-                          "which this run's own sparse VSLAM landmarks actually appear. Beyond "
-                          "that range nothing anchors the depth, so it cannot be calibrated or "
-                          "trusted -- and the figure comes from the VSLAM itself, needing no "
-                          "ground truth and no knowledge of the scene's scale.")
+                     help="metres, or 'auto' (default): the triangulation limit z = rel_tol * f "
+                          "* B / sigma_pix, i.e. the range at which a stereo baseline of "
+                          "--baseline_frames of the camera's own travel still gives "
+                          "--rel_depth_tol relative depth accuracy. Everything in it is "
+                          "measurable without ground truth. An earlier version took a percentile "
+                          "of the landmark cloud instead; that does NOT work, because monocular "
+                          "clouds are dominated by near-zero-parallax points whose depth is "
+                          "unconstrained, so the cloud reports its own garbage back as 'range'.")
     ap.add_argument("--w_ref", type=float, default=1.0,
                      help="legacy weighted_grid only: reference uncertainty (meters) at which "
                           "weight drops to 0.5")
@@ -494,6 +512,24 @@ def build_arg_parser():
                           "corrects this FDE model's in-domain bias and rejects pixels where a "
                           "surface rarely exists at all (sky). Ground truth is used to TRAIN it, "
                           "never at inference -- same status as the depth network's own training.")
+    ap.add_argument("--sky_cue", action="store_true",
+                     help="скасовувати відкидання таблицею там, де саме ЗОБРАЖЕННЯ каже, що "
+                          "піксель небом бути не може, тобто темний або текстурований. Таблиця "
+                          "індексована лише інтервалом глибини і номером рядка, тому в смузі "
+                          "горизонту крона дерева і небо потрапляють в одну комірку і "
+                          "відкидаються разом. Виміряно на наборі №1: у смузі рядків від 160 до "
+                          "240 поверхня є у 53%% пікселів, а в карту йшло 20%%. З вето втрата "
+                          "поверхні падає від значень від 10,5 до 17,3%% до значень від 0,1 до "
+                          "5,9%% на всіх семи наборах, а фантомів неба додається від 2 до 4 "
+                          "відсоткових пунктів. Для шару безпеки це правильний обмін: пропущена "
+                          "перешкода не повертається ніколи, а фантом стирають промені вільного "
+                          "простору з наступних кадрів. Застосовується ОДНАКОВО до базової і до "
+                          "ймовірнісної карти. Еталон не потрібен.")
+    ap.add_argument("--sky_cue_percentile", type=float, default=70.0,
+                     help="з --sky_cue: перцентиль градієнта кадру, вище якого піксель вважається "
+                          "текстурованим. Підібрано на наборах №1 до №3, перевірено на №4 до №7. "
+                          "Перцентиль, а не абсолютний поріг, тому величина береться з самого "
+                          "кадру.")
     ap.add_argument("--refiner_min_validity", type=float, default=0.5,
                      help="with --depth_refiner: drop pixels whose cell had a real surface less "
                           "often than this in training")
@@ -532,6 +568,24 @@ def build_arg_parser():
                           "uncertainty-limited carving, because a depth estimate off by several "
                           "meters makes each extra sample another chance to erase a real "
                           "surface; revisit this once depth error drops.")
+    ap.add_argument("--prob_maps", metavar="DIR",
+                     help="save the 2D occupancy probability for EVERY processed frame as a PNG: "
+                          "P = sigmoid(l_occ * w) per pixel, after all corrections, with rejected "
+                          "pixels left blank. One image per frame, nothing else.")
+    ap.add_argument("--dump_intermediate", metavar="DIR",
+                     help="save the representation that exists AFTER VSLAM + FDE + every "
+                          "correction but BEFORE voxelisation: per-frame depth/confidence/sigma "
+                          "fields for --dump_frames sample frames, plus the whole weighted point "
+                          "cloud. Render it with view_intermediate.py.")
+    ap.add_argument("--dump_frames", type=int, default=6,
+                     help="with --dump_intermediate: how many sample frames to save 2D fields for")
+    ap.add_argument("--dump_frame_name",
+                     help="restrict --dump_intermediate AND --prob_maps to this ONE frame, named "
+                          "exactly as its file in cam0/data (e.g. 1775034831515681460.png). The "
+                          "run itself still processes every sampled frame, so the self-calibrating "
+                          "scales are the warmed-up ones this flight actually produced, not a "
+                          "first-frame guess -- only the saving is narrowed. Without it the dump "
+                          "picks frames by a fixed stride, which cannot land on a chosen frame.")
     ap.add_argument("--gt_compare", action="store_true",
                      help="evaluation-only, --mode dataset: also backproject GT depth (via GT "
                           "poses, dataset_root/depth0/) into a reference grid on the SAME voxel "
@@ -572,6 +626,39 @@ def build_arg_parser():
     return ap
 
 
+naive_grid_l_occ = 0.85  # same increment ProbabilisticVoxelGrid applies per hit
+
+
+def save_prob_map(out_dir, fname, conf_map, depth, min_depth, max_depth, l_occ):
+    """One PNG per frame: the occupancy probability this frame writes into the
+    map, pixel by pixel, after every correction. A pixel that was rejected, or
+    whose depth fell outside the usable range, is left blank."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    usable = np.isfinite(conf_map) & np.isfinite(depth) & (depth > min_depth) & (depth < max_depth)
+    prob = np.where(usable, 1.0 / (1.0 + np.exp(-l_occ * np.nan_to_num(conf_map))), np.nan)
+
+    # The colour range is the range this quantity CAN take, not [0.5, 1]: a
+    # single observation contributes l_occ * w with the weight w in [0, 1], so
+    # one frame can never push a voxel past sigmoid(l_occ) ~ 0.70. Scaling to
+    # 1.0 made every frame render as one flat colour and hid the whole signal.
+    p_max = 1.0 / (1.0 + np.exp(-l_occ))
+
+    fig, ax = plt.subplots(figsize=(7.5, 5.6))
+    im = ax.imshow(prob, cmap="RdYlGn_r", vmin=0.5, vmax=p_max, interpolation="nearest")
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_title(f"{os.path.splitext(fname)[0]}   P(зайнято) з одного кадру\n"
+                 f"{int(usable.sum())} з {usable.size} пікселів у карту "
+                 f"({100*usable.mean():.0f}%), біле = відкинуто", fontsize=10)
+    cb = fig.colorbar(im, ax=ax, fraction=0.046)
+    cb.set_label(f"P(зайнято), максимум з одного кадру {p_max:.2f}")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f"prob_{os.path.splitext(fname)[0]}.png"), dpi=100)
+    plt.close(fig)
+
+
 def grey_for_net(args, fname, cam_h, cam_w):
     """Greyscale frame at the dataset's own resolution, for the network's image
     and gradient channels."""
@@ -582,7 +669,21 @@ def grey_for_net(args, fname, cam_h, cam_w):
     return img
 
 
-def run_dataset_mode(args):
+def run_dataset_mode(args, hooks=None):
+    """hooks: необов'язковий словник зворотних викликів для інструментів, що
+    хочуть бачити проміжні величини цього ж прогону, не повторюючи його код.
+    За замовчуванням None, тобто поведінка не змінюється жодним чином.
+
+        "frame"(ctx)              після того, як для кадру остаточно пораховані
+                                  вага довіри і відкалібрована глибина
+        "grid_frame"(name, i, g)  після вставки i-го кадру у сітку name
+        "grids"(d)                коли всі сітки побудовані
+
+    Викликач нічого не повертає, усі словники передаються лише для читання."""
+    hooks = hooks or {}
+    hook_frame = hooks.get("frame")
+    hook_grid_frame = hooks.get("grid_frame")
+    hook_grids = hooks.get("grids")
     os.makedirs(args.output_dir, exist_ok=True)
     if not (args.dataset_root and args.vslam_dir and args.fde_dir):
         raise SystemExit("--mode dataset requires --dataset_root, --vslam_dir and --fde_dir")
@@ -648,13 +749,34 @@ def run_dataset_mode(args):
 
     idx_step = max(1, len(frames) // args.n_frames)
     chosen = frames[::idx_step][:args.n_frames]
+    if args.dump_frame_name:
+        # Кадр, який просили зберегти, майже напевно не збігається з кроком
+        # вибірки, тому його додають явно і ставлять у хронологічний порядок:
+        # самоналаштовні масштаби оновлюються послідовно, і кадр має побачити
+        # той самий стан, що й у звичайному прогоні.
+        if not any(f == args.dump_frame_name for _t, f in chosen):
+            extra = [(t, f) for t, f in frames if f == args.dump_frame_name]
+            if not extra:
+                raise SystemExit(f"--dump_frame_name {args.dump_frame_name}: такого кадру немає "
+                                 f"в cam0/data.csv")
+            chosen = sorted(chosen + extra, key=lambda tf: tf[0])
+            print(f"[dump] кадр {args.dump_frame_name} додано у вибірку "
+                  f"({len(chosen)} кадрів разом)")
     rng = np.random.default_rng(0)
 
     blades = None
     if args.blade_mask and os.path.exists(args.blade_mask):
-        blades = bm.load_mask(args.blade_mask, shape=(cam_h, cam_w))
+        # Маска описує гвинти ОДНОГО апарата, тому її беруть лише для тих
+        # наборів, на яких її й міряли. Інакше вона мовчки викидає справжні
+        # пікселі з набору, у якого гвинтів у кадрі немає.
+        ds_name = os.path.basename(os.path.normpath(args.dataset_root))
+        parent = os.path.basename(os.path.dirname(os.path.normpath(args.dataset_root)))
+        name = ds_name if bm.applies_to(args.blade_mask, ds_name) else parent
+        blades = bm.load_mask(args.blade_mask, shape=(cam_h, cam_w), dataset_name=name)
         if blades.sum() == 0:
             blades = None
+            print(f"[blade_mask] {args.blade_mask} не стосується набору {name} -- маска не "
+                  f"застосовується")
         else:
             print(f"[blade_mask] excluding {int(blades.sum())} px/frame from EVERY variant")
 
@@ -721,6 +843,16 @@ def run_dataset_mode(args):
                                        window_frames=int(args.anchor_window_frames))
 
     gt_depth_dir = os.path.join(args.dataset_root, "depth0", "data")
+    prob_dir = args.prob_maps
+    if prob_dir:
+        os.makedirs(prob_dir, exist_ok=True)
+
+    dump_dir = args.dump_intermediate
+    dumped, dump_every = 0, None
+    if dump_dir:
+        os.makedirs(dump_dir, exist_ok=True)
+        dump_every = max(1, len(chosen) // max(1, args.dump_frames))
+
     all_pts, all_weights, all_origins = [], [], []
     all_pts_w, all_weights_w = [], []
     all_pts_a, all_weights_a, all_sigma_a, all_origins_a = [], [], [], []
@@ -756,6 +888,8 @@ def run_dataset_mode(args):
                 all_pts_gt.append(pts_gt)
                 all_origins_gt.append(T_wc_gt[:3, 3])
 
+        raw_fde_depth = pred_depth.copy()
+
         # The network runs first and, like the table below, before every
         # variant, so switching it on is a clean comparison rather than a
         # change only the adaptive path sees.
@@ -787,6 +921,12 @@ def run_dataset_mode(args):
         if refiner is not None:
             pred_depth, refine_keep = depth_refine.apply_refiner(
                 refiner, pred_depth, min_validity=args.refiner_min_validity)
+        if args.sky_cue:
+            # Вето з зображення стоїть ТУТ, до побудови будь-якого варіанта, тому
+            # базова і ймовірнісна карта бачать однаковий набір пікселів.
+            not_sky = sky_cue.structure_mask(grey_for_net(args, fname, cam_h, cam_w),
+                                              grad_percentile=args.sky_cue_percentile)
+            refine_keep = not_sky if refine_keep is None else (refine_keep | not_sky)
 
         naive_wm = np.ones_like(pred_depth)
         if blades is not None:
@@ -848,6 +988,45 @@ def run_dataset_mode(args):
                 # P>0.5 any positive weight still marks the voxel occupied.
                 conf_map = np.where(drop, np.nan, conf_map)
                 corrected = np.clip(alpha_map * pred_depth + beta_map, 0.0, None)
+
+                wanted = args.dump_frame_name is None or fname == args.dump_frame_name
+                if prob_dir and wanted:
+                    save_prob_map(prob_dir, fname, conf_map, corrected,
+                                   args.min_depth, args.max_depth, naive_grid_l_occ)
+
+                if dump_dir and wanted and (args.dump_frame_name is not None
+                                             or ((len(all_pts) - 1) % dump_every == 0
+                                                 and dumped < args.dump_frames)):
+                    np.savez_compressed(
+                        os.path.join(dump_dir, "chosen_frame.npz" if args.dump_frame_name
+                                      else f"frame_{dumped:02d}.npz"),
+                        fde_raw=raw_fde_depth.astype(np.float32),
+                        depth_after_net_or_table=pred_depth.astype(np.float32),
+                        depth_calibrated=corrected.astype(np.float32),
+                        alpha=alpha_map.astype(np.float32), beta=beta_map.astype(np.float32),
+                        confidence=conf_map.astype(np.float32), sigma_m=sigma_map.astype(np.float32),
+                        dropped=drop, anchors_uv=np.stack([au, av], 1).astype(np.float32),
+                        anchors_z=az.astype(np.float32), frame=fname,
+                        T_wc=T_wc, K=K,
+                        residual_scale=float(local_calib.residual_scale.value),
+                        bandwidth_scale=float(local_calib.bandwidth_scale.value),
+                        sigma_pose=float(sigma_pose_val),
+                        blades=(blades if blades is not None else np.zeros_like(drop)),
+                        refine_dropped=(~refine_keep if refine_keep is not None
+                                         else np.zeros_like(drop)))
+                    dumped += 1
+                if hook_frame is not None:
+                    hook_frame(dict(
+                        fname=fname, frame_t=frame_t, index=len(all_pts_a),
+                        fde_raw=raw_fde_depth, depth_after_table=pred_depth,
+                        depth_calibrated=corrected,
+                        alpha=alpha_map, beta=beta_map, confidence=conf_map,
+                        sigma_depth=sigma_depth_map, sigma_total=sigma_map,
+                        sigma_pose=sigma_pose_val, support=support_map, dropped=drop,
+                        refine_keep=refine_keep, blades=blades,
+                        anchors_u=au, anchors_v=av, anchors_z=az,
+                        T_wc=T_wc, K=K, origin=origin, local_calib=local_calib,
+                        min_depth=args.min_depth, max_depth=args.max_depth))
                 pts_a, w_a, sig_a = backproject_with_weight_map(
                     corrected, conf_map, K, T_wc, args.min_depth, args.max_depth,
                     max_points=args.max_points_per_frame, rng=rng, extra_maps=(sigma_map,))
@@ -870,11 +1049,31 @@ def run_dataset_mode(args):
         print("Nothing to save.")
         return
 
+    if dump_dir and all_pts_a:
+        np.savez_compressed(
+            os.path.join(dump_dir, "cloud_before_voxels.npz"),
+            points=np.concatenate(all_pts_a).astype(np.float32),
+            weights=np.concatenate(all_weights_a).astype(np.float32),
+            sigma_m=np.concatenate(all_sigma_a).astype(np.float32),
+            origins=np.stack(all_origins_a).astype(np.float32),
+            points_naive=np.concatenate(all_pts).astype(np.float32))
+        print(f"[dump] {dumped} frames of 2D fields + the weighted cloud -> {dump_dir}")
+
     points_a = np.concatenate(all_pts_a, axis=0) if all_pts_a else np.zeros((0, 3))
     weights_a = np.concatenate(all_weights_a, axis=0) if all_weights_a else np.zeros(0)
     bounds_src = np.concatenate([p for p in (points, points_a) if len(p)], axis=0)
     if isinstance(args.voxel_resolution, str):
-        if args.voxel_resolution != "auto":
+        if args.voxel_resolution == "fine":
+            # The finest voxel this scene fits in the budget. Purely a display
+            # choice: nothing here claims the depth is good to that resolution.
+            span = bounds_src.max(axis=0) - bounds_src.min(axis=0) + 2.0
+            volume = float(np.prod(np.maximum(span, 1.0)))
+            args.voxel_resolution = max(args.min_voxel,
+                                         (volume / args.max_grid_voxels) ** (1.0 / 3.0))
+            print(f"[fine] voxel_resolution = {args.voxel_resolution:.2f}m "
+                  f"(finest that keeps a {span.round(0)} m scene under "
+                  f"{args.max_grid_voxels/1e6:.0f}M voxels, floor {args.min_voxel} m)")
+        elif args.voxel_resolution != "auto":
             args.voxel_resolution = float(args.voxel_resolution)
         elif local_calib is not None and local_calib.n_frames_calibrated > 0:
             args.voxel_resolution = float(args.voxel_per_sigma * local_calib.residual_scale.value)
@@ -897,8 +1096,10 @@ def run_dataset_mode(args):
 
     # ---------- naive baseline: fixed log-odds, no weighting ----------
     naive_grid = ProbabilisticVoxelGrid(bounds_min, bounds_max, args.voxel_resolution)
-    for pts, origin in zip(all_pts, all_origins):
+    for i, (pts, origin) in enumerate(zip(all_pts, all_origins)):
         naive_grid.insert_weighted(pts, np.ones(len(pts)), origin, n_ray_samples=args.n_ray_samples)
+        if hook_grid_frame is not None:
+            hook_grid_frame("naive", i, naive_grid)
 
     # ---------- legacy formula-based weighting, only if --error_model given ----------
     weighted_grid = None
@@ -917,13 +1118,17 @@ def run_dataset_mode(args):
             bounds_min, bounds_max, args.voxel_resolution,
             consistency_tau=depth_calib.RunningScale(init=args.consistency_tau, half_life=30),
             use_consistency=not args.no_consistency, sensor_model=sensor_model)
-        for pts_a, w_a, sig_a, origin in zip(all_pts_a, all_weights_a, all_sigma_a, all_origins_a):
+        for i, (pts_a, w_a, sig_a, origin) in enumerate(
+                zip(all_pts_a, all_weights_a, all_sigma_a, all_origins_a)):
             adaptive_grid.insert_weighted(pts_a, w_a, origin, sigma=sig_a,
                                            n_ray_samples=args.n_ray_samples,
                                            splat_k_sigma=args.splat_k_sigma,
                                            splat_max_radius_voxels=args.splat_max_radius_voxels,
                                            splat_occupied=args.splat)
+            if hook_grid_frame is not None:
+                hook_grid_frame("adaptive", i, adaptive_grid)
 
+    gt_grid = None
     if args.gt_compare and len(points_gt) > 0:
         # Reference = "which voxels contain a true surface", so no free-space
         # ray-casting here (n_ray_samples=0): GT rays grazing along a wall
@@ -962,6 +1167,11 @@ def run_dataset_mode(args):
     elif args.gt_compare:
         print("\n[gt_compare] requested but no GT depth frames matched -- skipped")
 
+    if hook_grids is not None:
+        hook_grids(dict(naive=naive_grid, weighted=weighted_grid, adaptive=adaptive_grid,
+                        gt=gt_grid, bounds_min=bounds_min, bounds_max=bounds_max,
+                        resolution=args.voxel_resolution,
+                        frames=[o for o in all_origins_a], K=K))
     save_grids(args.output_dir, naive_grid, weighted_grid, adaptive_grid)
     print(f"Naive occupied voxels:    {int(naive_grid.occupied_mask().sum())}")
     if weighted_grid is not None:

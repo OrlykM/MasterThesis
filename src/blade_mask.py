@@ -79,11 +79,35 @@ def compute(args):
     report(args.output)
 
 
-def load_mask(path, shape=None):
+def applies_to(path, dataset_name):
+    """Is this mask valid for `dataset_name`? The mask describes ONE airframe:
+    where that aircraft's own propellers sit in its own camera. It is derived
+    from, and only meaningful for, the sequences listed in its `names` field.
+
+    This check exists because of a real mistake: the AirSim mask happens to be
+    480x640, the Isaac Sim dataset is 480x640 too, so passing the same file for
+    every run silently removed 8274 real pixels (2.69% of the frame, the lower
+    corners, where that dataset shows the path and the ground) from a dataset
+    whose aircraft has no propellers in view at all.
+
+    A dataset not listed, and not obviously part of the same recording family,
+    gets no mask rather than someone else's."""
+    try:
+        names = [str(x) for x in np.load(path, allow_pickle=True)["names"]]
+    except (KeyError, OSError, ValueError):
+        return True  # старі файли без поля names -- поводимось як раніше
+    return dataset_name in names
+
+
+def load_mask(path, shape=None, dataset_name=None):
     """-> boolean (H, W) mask of pixels to exclude, resized by nearest
-    neighbour if the caller's frames are a different size."""
-    d = np.load(path)
+    neighbour if the caller's frames are a different size. With dataset_name
+    given, returns an all-False mask when the file does not cover that
+    dataset (see applies_to)."""
+    d = np.load(path, allow_pickle=True)
     mask = d["mask"]
+    if dataset_name is not None and not applies_to(path, dataset_name):
+        mask = np.zeros_like(mask, dtype=bool)
     if shape is not None and mask.shape != tuple(shape):
         from PIL import Image
         mask = np.array(Image.fromarray(mask.astype(np.uint8) * 255)

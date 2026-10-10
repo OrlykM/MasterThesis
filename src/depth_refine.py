@@ -173,7 +173,12 @@ def apply_refiner(model, pred_depth, min_validity=0.5):
     # not a domain bias, it's a badly-sampled bin.
     ratio = np.clip(np.where(np.isfinite(ratio), ratio, 1.0), 0.25, 4.0)
     corrected = pred_depth * ratio
-    keep = np.isfinite(validity) & (validity >= min_validity)
+    # A cell with NO training data means "no evidence", not "no surface".
+    # Treating NaN as a rejection threw away real image area: masking the
+    # propellers out of TRAINING left the lower-corner cells empty, and those
+    # same cells were then rejected at inference even on the Isaac Sim dataset,
+    # which has no propellers at all.
+    keep = ~np.isfinite(validity) | (validity >= min_validity)
     return corrected, keep
 
 
