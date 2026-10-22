@@ -47,28 +47,45 @@ _HDR = "!4sBBIHHI"
 _HDR_SIZE = struct.calcsize(_HDR)
 MSG_FRAME2, MSG_CONF2D, MSG_GRID_DELTA, MSG_GRID = 3, 4, 5, 2
 F_HAS_K, F_HAS_IMAGE, F_HAS_LANDMARKS = 1, 2, 4
+F_HAS_DEPTH, F_HAS_POSE, F_IMAGE_RGB = 8, 16, 32
 
 
-def _encode_frame2(timestamp, depth, T_wc, pose_x=0.0, K=None, image=None, landmarks=None):
-    depth = np.ascontiguousarray(depth, dtype=np.float32)
-    h, w = depth.shape
+def _encode_frame2(timestamp, depth=None, T_wc=None, pose_x=0.0, K=None,
+                    image=None, landmarks=None):
     flags = 0
-    if K is not None:
-        flags |= F_HAS_K
+    h = w = None
+    if depth is not None:
+        flags |= F_HAS_DEPTH
+        depth = np.ascontiguousarray(depth, dtype=np.float32)
+        h, w = depth.shape
     if image is not None:
         flags |= F_HAS_IMAGE
         image = np.ascontiguousarray(image, dtype=np.uint8)
-        if image.shape != (h, w):
-            raise ValueError(f"image {image.shape} не збігається з depth {(h, w)}")
+        if image.ndim == 3:
+            flags |= F_IMAGE_RGB
+            ih, iw = image.shape[:2]
+        else:
+            ih, iw = image.shape
+        if h is None:
+            h, w = ih, iw
+        elif (ih, iw) != (h, w):
+            raise ValueError(f"зображення {(ih, iw)} не збігається з глибиною {(h, w)}")
+    if h is None:
+        raise ValueError("кадр має нести або глибину, або зображення")
+    if K is not None:
+        flags |= F_HAS_K
+    if T_wc is not None:
+        flags |= F_HAS_POSE
     lm = np.zeros((0, 3), np.float32)
     if landmarks is not None and len(landmarks):
         flags |= F_HAS_LANDMARKS
         lm = np.ascontiguousarray(landmarks, dtype=np.float32).reshape(-1, 3)
     Kf = np.ascontiguousarray(K, np.float64).reshape(9) if K is not None else np.zeros(9)
+    Tf = (np.ascontiguousarray(T_wc, np.float64).reshape(16)
+          if T_wc is not None else np.eye(4).reshape(16))
     return b"".join([struct.pack("!dBBIIdI", timestamp, flags, 0, h, w, float(pose_x), len(lm)),
-                     Kf.tobytes(),
-                     np.ascontiguousarray(T_wc, np.float64).reshape(16).tobytes(),
-                     depth.tobytes(),
+                     Kf.tobytes(), Tf.tobytes(),
+                     depth.tobytes() if flags & F_HAS_DEPTH else b"",
                      image.tobytes() if flags & F_HAS_IMAGE else b"",
                      lm.tobytes() if flags & F_HAS_LANDMARKS else b""])
 
@@ -111,7 +128,7 @@ class TcpClient:
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock.settimeout(None)
 
-    def send(self, frame_id, timestamp, depth, T_wc, pose_x=0.0, K=None,
+    def send(self, frame_id, timestamp, depth=None, T_wc=None, pose_x=0.0, K=None,
              image=None, landmarks=None):
         body = zlib.compress(
             _encode_frame2(timestamp, depth, T_wc, pose_x, K, image, landmarks), 1)
@@ -163,7 +180,7 @@ class Client:
         self.rx.settimeout(0.3)
         self._pending = {}
 
-    def send(self, frame_id, timestamp, depth, T_wc, pose_x=0.0, K=None,
+    def send(self, frame_id, timestamp, depth=None, T_wc=None, pose_x=0.0, K=None,
              image=None, landmarks=None):
         payload = zlib.compress(
             _encode_frame2(timestamp, depth, T_wc, pose_x, K, image, landmarks), 1)
@@ -243,6 +260,9 @@ def main():
                      help="через інтернет. Одне з'єднання в обидва боки, втрати TCP повторює "
                           "сам. По UDP кадр на 700 КБ при 1 відсотку втрат доходить цілим "
                           "лише у 0,7 відсотка випадків")
+    ap.add_argument("--image_only", action="store_true",
+                     help="слати ЛИШЕ картинку, без глибини, пози і точок. Тоді все це має "
+                          "порахувати приймач своїми VSLAM і FDE")
     ap.add_argument("--scale", type=int, default=1,
                      help="зменшити глибину і зображення у N разів перед відправкою. На "
                           "вузькому каналі це головний важіль")
@@ -272,8 +292,12 @@ def main():
             depth = depth[:h2, :w2].reshape(h2 // k, k, w2 // k, k).mean(axis=(1, 3)).astype(np.float32)
             grey = grey[:h2, :w2].reshape(h2 // k, k, w2 // k, k).mean(axis=(1, 3)).astype(np.uint8)
             K = K.copy(); K[0, 0] /= k; K[1, 1] /= k; K[0, 2] /= k; K[1, 2] /= k
-        c.send(i, time.time(), depth, T, K=K, image=grey, landmarks=lm)
-        sent = f"{depth.shape[1]}x{depth.shape[0]}, {len(lm)} точок"
+        if args.image_only:
+            c.send(i, time.time(), None, None, image=grey)
+            sent = f"{grey.shape[1]}x{grey.shape[0]}, ЛИШЕ картинка"
+        else:
+            c.send(i, time.time(), depth, T, K=K, image=grey, landmarks=lm)
+            sent = f"{depth.shape[1]}x{depth.shape[0]}, {len(lm)} точок"
         back = []
         for m in c.results(timeout=max(0.25, 1.0 / args.rate)):
             if m["type"] == "conf2d":

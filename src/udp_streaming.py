@@ -55,6 +55,9 @@ KIND_ADAPTIVE = 2
 F_HAS_K = 1 << 0
 F_HAS_IMAGE = 1 << 1
 F_HAS_LANDMARKS = 1 << 2
+F_HAS_DEPTH = 1 << 3      # глибини може не бути: тоді її рахує приймач
+F_HAS_POSE = 1 << 4       # пози теж: тоді її рахує VSLAM на боці приймача
+F_IMAGE_RGB = 1 << 5      # зображення тривимірне, тобто кольорове
 
 
 def _make_socket(buf_opt, buf_size):
@@ -211,7 +214,8 @@ def decode_grid(payload):
 
 # --------------------------------------------------------------- кадр версії 2
 
-def encode_frame2(timestamp, depth, T_wc, pose_x=0.0, K=None, image=None, landmarks=None):
+def encode_frame2(timestamp, depth=None, T_wc=None, pose_x=0.0, K=None, image=None,
+                   landmarks=None):
     """Кадр з усім, що потрібно ЙМОВІРНІСНОМУ шару, а не лише глибиною.
 
     image      яскравість кадру, uint8, того ж розміру, що й глибина. Потрібна
@@ -221,25 +225,42 @@ def encode_frame2(timestamp, depth, T_wc, pose_x=0.0, K=None, image=None, landma
                карту без ваг довіри. Перетворення масштабу це справа
                відправника: приймач нічого не вирівнює.
     """
-    depth = np.ascontiguousarray(depth, dtype=np.float32)
-    h, w = depth.shape
     flags = 0
-    if K is not None:
-        flags |= F_HAS_K
+    h = w = None
+    if depth is not None:
+        flags |= F_HAS_DEPTH
+        depth = np.ascontiguousarray(depth, dtype=np.float32)
+        h, w = depth.shape
     if image is not None:
         flags |= F_HAS_IMAGE
         image = np.ascontiguousarray(image, dtype=np.uint8)
-        if image.shape != (h, w):
-            raise ValueError(f"image {image.shape} не збігається з depth {(h, w)}")
+        if image.ndim == 3:
+            flags |= F_IMAGE_RGB
+            ih, iw = image.shape[:2]
+        else:
+            ih, iw = image.shape
+        if h is None:
+            h, w = ih, iw
+        elif (ih, iw) != (h, w):
+            raise ValueError(f"зображення {(ih, iw)} не збігається з глибиною {(h, w)}")
+    if h is None:
+        raise ValueError("кадр має нести або глибину, або зображення")
+    if K is not None:
+        flags |= F_HAS_K
+    if T_wc is not None:
+        flags |= F_HAS_POSE
     lm = np.zeros((0, 3), dtype=np.float32)
     if landmarks is not None and len(landmarks):
         flags |= F_HAS_LANDMARKS
         lm = np.ascontiguousarray(landmarks, dtype=np.float32).reshape(-1, 3)
     K_flat = np.ascontiguousarray(K, dtype=np.float64).reshape(9) if K is not None else np.zeros(9)
-    T_flat = np.ascontiguousarray(T_wc, dtype=np.float64).reshape(16)
+    T_flat = (np.ascontiguousarray(T_wc, dtype=np.float64).reshape(16)
+              if T_wc is not None else np.eye(4).reshape(16))
 
     parts = [struct.pack("!dBBIIdI", timestamp, flags, 0, h, w, float(pose_x), len(lm)),
-             K_flat.tobytes(), T_flat.tobytes(), depth.tobytes()]
+             K_flat.tobytes(), T_flat.tobytes()]
+    if flags & F_HAS_DEPTH:
+        parts.append(depth.tobytes())
     if flags & F_HAS_IMAGE:
         parts.append(image.tobytes())
     if flags & F_HAS_LANDMARKS:
@@ -255,18 +276,24 @@ def decode_frame2(payload):
     K_flat = np.frombuffer(payload, dtype=np.float64, count=9, offset=off).copy(); off += 72
     T_wc = np.frombuffer(payload, dtype=np.float64, count=16, offset=off).reshape(4, 4).copy()
     off += 128
-    depth = np.frombuffer(payload, dtype=np.float32, count=h * w, offset=off).reshape(h, w).copy()
-    off += h * w * 4
+    depth = None
+    if flags & F_HAS_DEPTH:
+        depth = np.frombuffer(payload, dtype=np.float32, count=h * w,
+                               offset=off).reshape(h, w).copy()
+        off += h * w * 4
     image = None
     if flags & F_HAS_IMAGE:
-        image = np.frombuffer(payload, dtype=np.uint8, count=h * w, offset=off).reshape(h, w).copy()
-        off += h * w
+        ch = 3 if flags & F_IMAGE_RGB else 1
+        image = np.frombuffer(payload, dtype=np.uint8, count=h * w * ch, offset=off)
+        image = image.reshape(h, w, 3).copy() if ch == 3 else image.reshape(h, w).copy()
+        off += h * w * ch
     landmarks = None
     if flags & F_HAS_LANDMARKS and n_lm:
         landmarks = np.frombuffer(payload, dtype=np.float32, count=n_lm * 3,
                                    offset=off).reshape(-1, 3).copy()
     return {"timestamp": timestamp, "K": K_flat.reshape(3, 3) if flags & F_HAS_K else None,
-            "T_wc": T_wc, "pose_x": pose_x, "depth": depth,
+            "T_wc": T_wc if flags & F_HAS_POSE else None,
+            "pose_x": pose_x, "depth": depth,
             "image": image, "landmarks": landmarks}
 
 
