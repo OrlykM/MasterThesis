@@ -31,6 +31,7 @@ Wire format, big-endian, one UDP datagram per chunk:
 """
 import socket
 import struct
+import threading
 import time
 import zlib
 
@@ -43,8 +44,17 @@ _MAX_DATAGRAM = 65507
 
 MSG_FRAME = 1
 MSG_GRID = 2
+MSG_FRAME2 = 3      # кадр з зображенням і розрідженими точками VSLAM
+MSG_CONF2D = 4      # покадрова 2D карта довіри
+MSG_GRID_DELTA = 5  # лише вокселі, які змінив цей кадр
 KIND_NAIVE = 0
 KIND_WEIGHTED = 1
+KIND_ADAPTIVE = 2
+
+# прапорці кадру v2
+F_HAS_K = 1 << 0
+F_HAS_IMAGE = 1 << 1
+F_HAS_LANDMARKS = 1 << 2
 
 
 def _make_socket(buf_opt, buf_size):
@@ -118,15 +128,20 @@ class UDPReceiver:
         self.sock.bind((host, port))
         self.sock.settimeout(poll_timeout)
         self._reassembler = _Reassembler(stale_after=stale_after)
+        self.last_addr = None
 
     def messages(self, idle_timeout=None):
         """Yields (msg_type, kind, msg_id, payload) as messages complete.
         Runs until idle_timeout seconds pass with nothing received at all
-        (None = run forever, i.e. until the caller stops iterating)."""
+        (None або 0 = чекати вічно). Адреса відправника лишається в
+        self.last_addr, щоб можна було відповісти туди ж."""
+        if not idle_timeout:
+            idle_timeout = None
         last_rx = time.monotonic()
         while True:
             try:
-                packet, _addr = self.sock.recvfrom(_MAX_DATAGRAM)
+                packet, addr = self.sock.recvfrom(_MAX_DATAGRAM)
+                self.last_addr = addr
             except socket.timeout:
                 self._reassembler.evict_stale()
                 if idle_timeout is not None and time.monotonic() - last_rx > idle_timeout:
@@ -194,6 +209,125 @@ def decode_grid(payload):
     return {"resolution": resolution, "origin": origin, "log_odds": log_odds}
 
 
+# --------------------------------------------------------------- кадр версії 2
+
+def encode_frame2(timestamp, depth, T_wc, pose_x=0.0, K=None, image=None, landmarks=None):
+    """Кадр з усім, що потрібно ЙМОВІРНІСНОМУ шару, а не лише глибиною.
+
+    image      яскравість кадру, uint8, того ж розміру, що й глибина. Потрібна
+               ознаці неба з sky_cue.py.
+    landmarks  розріджені точки VSLAM (N, 3) у ТІЙ САМІЙ світовій системі, що й
+               T_wc. Без них локальне калібрування неможливе, і кадр піде в
+               карту без ваг довіри. Перетворення масштабу це справа
+               відправника: приймач нічого не вирівнює.
+    """
+    depth = np.ascontiguousarray(depth, dtype=np.float32)
+    h, w = depth.shape
+    flags = 0
+    if K is not None:
+        flags |= F_HAS_K
+    if image is not None:
+        flags |= F_HAS_IMAGE
+        image = np.ascontiguousarray(image, dtype=np.uint8)
+        if image.shape != (h, w):
+            raise ValueError(f"image {image.shape} не збігається з depth {(h, w)}")
+    lm = np.zeros((0, 3), dtype=np.float32)
+    if landmarks is not None and len(landmarks):
+        flags |= F_HAS_LANDMARKS
+        lm = np.ascontiguousarray(landmarks, dtype=np.float32).reshape(-1, 3)
+    K_flat = np.ascontiguousarray(K, dtype=np.float64).reshape(9) if K is not None else np.zeros(9)
+    T_flat = np.ascontiguousarray(T_wc, dtype=np.float64).reshape(16)
+
+    parts = [struct.pack("!dBBIIdI", timestamp, flags, 0, h, w, float(pose_x), len(lm)),
+             K_flat.tobytes(), T_flat.tobytes(), depth.tobytes()]
+    if flags & F_HAS_IMAGE:
+        parts.append(image.tobytes())
+    if flags & F_HAS_LANDMARKS:
+        parts.append(lm.tobytes())
+    return b"".join(parts)
+
+
+def decode_frame2(payload):
+    fmt = "!dBBIIdI"
+    size = struct.calcsize(fmt)
+    timestamp, flags, _res, h, w, pose_x, n_lm = struct.unpack(fmt, payload[:size])
+    off = size
+    K_flat = np.frombuffer(payload, dtype=np.float64, count=9, offset=off).copy(); off += 72
+    T_wc = np.frombuffer(payload, dtype=np.float64, count=16, offset=off).reshape(4, 4).copy()
+    off += 128
+    depth = np.frombuffer(payload, dtype=np.float32, count=h * w, offset=off).reshape(h, w).copy()
+    off += h * w * 4
+    image = None
+    if flags & F_HAS_IMAGE:
+        image = np.frombuffer(payload, dtype=np.uint8, count=h * w, offset=off).reshape(h, w).copy()
+        off += h * w
+    landmarks = None
+    if flags & F_HAS_LANDMARKS and n_lm:
+        landmarks = np.frombuffer(payload, dtype=np.float32, count=n_lm * 3,
+                                   offset=off).reshape(-1, 3).copy()
+    return {"timestamp": timestamp, "K": K_flat.reshape(3, 3) if flags & F_HAS_K else None,
+            "T_wc": T_wc, "pose_x": pose_x, "depth": depth,
+            "image": image, "landmarks": landmarks}
+
+
+# ------------------------------------------------- 2D карта довіри як повідомлення
+
+def encode_conf2d(timestamp, confidence, depth=None, half=True):
+    """confidence: (H, W) float, нечисло означає відкинутий піксель.
+    half: передавати як float16, тобто вдвічі менше байтів. Для величини від 0
+    до 1 це близько трьох значущих цифр, чого для карти довіри досить."""
+    conf = np.ascontiguousarray(confidence, dtype=np.float16 if half else np.float32)
+    h, w = conf.shape
+    flags = 1 if depth is not None else 0
+    parts = [struct.pack("!dIIBB", timestamp, h, w, 1 if half else 0, flags), conf.tobytes()]
+    if depth is not None:
+        parts.append(np.ascontiguousarray(depth, dtype=np.float32).tobytes())
+    return b"".join(parts)
+
+
+def decode_conf2d(payload):
+    fmt = "!dIIBB"
+    size = struct.calcsize(fmt)
+    timestamp, h, w, half, flags = struct.unpack(fmt, payload[:size])
+    dt = np.float16 if half else np.float32
+    off = size
+    conf = np.frombuffer(payload, dtype=dt, count=h * w, offset=off).reshape(h, w).astype(np.float32)
+    off += h * w * np.dtype(dt).itemsize
+    depth = None
+    if flags & 1:
+        depth = np.frombuffer(payload, dtype=np.float32, count=h * w, offset=off).reshape(h, w).copy()
+    return {"timestamp": timestamp, "confidence": conf, "depth": depth}
+
+
+# ----------------------------------------------- приріст воксельної карти за кадр
+
+def encode_grid_delta(resolution, origin, dims, idx, values, timestamp=0.0):
+    """idx: (N, 3) int32 індекси змінених вокселів, values: (N,) нові log-odds.
+    Передавати весь масив щокадру немає сенсу: один кадр чіпає тисячі вокселів
+    з мільйонів."""
+    idx = np.ascontiguousarray(idx, dtype=np.int32).reshape(-1, 3)
+    values = np.ascontiguousarray(values, dtype=np.float32).reshape(-1)
+    header = struct.pack("!dd3d3II", timestamp, float(resolution),
+                         *[float(x) for x in origin], *[int(x) for x in dims], len(idx))
+    return header + idx.tobytes() + values.tobytes()
+
+
+def decode_grid_delta(payload):
+    fmt = "!dd3d3II"
+    size = struct.calcsize(fmt)
+    vals = struct.unpack(fmt, payload[:size])
+    timestamp, resolution = vals[0], vals[1]
+    origin = np.array(vals[2:5], dtype=np.float64)
+    dims = tuple(int(x) for x in vals[5:8])
+    n = int(vals[8])
+    off = size
+    idx = np.frombuffer(payload, dtype=np.int32, count=n * 3, offset=off).reshape(-1, 3).copy()
+    off += n * 12
+    values = np.frombuffer(payload, dtype=np.float32, count=n, offset=off).copy()
+    return {"timestamp": timestamp, "resolution": resolution, "origin": origin,
+            "dims": dims, "idx": idx, "values": values}
+
+
 class FrameSender:
     """Sends per-frame (depth, pose, ...) input to a occupancy_3d_map.py
     ``--mode udp`` receiver, e.g. from a live camera/VSLAM front-end or from
@@ -208,6 +342,16 @@ class FrameSender:
         payload = encode_frame(timestamp, depth, T_wc, pose_x=pose_x, K=K)
         _send_chunked(self.sock, self.addr, MSG_FRAME, 0, frame_id, payload, self.chunk_size)
 
+    def send_frame2(self, frame_id, timestamp, depth, T_wc, pose_x=0.0, K=None,
+                    image=None, landmarks=None):
+        """Кадр з зображенням і розрідженими точками VSLAM. Саме цей варіант
+        потрібен, щоб на приймачі побудувалась карта ДОВІРИ, а не просто карта
+        зайнятості: без точок немає калібрування, без зображення немає вето
+        неба."""
+        payload = encode_frame2(timestamp, depth, T_wc, pose_x=pose_x, K=K,
+                                 image=image, landmarks=landmarks)
+        _send_chunked(self.sock, self.addr, MSG_FRAME2, 0, frame_id, payload, self.chunk_size)
+
     def close(self):
         self.sock.close()
 
@@ -217,11 +361,19 @@ class FrameReceiver:
         self._rx = UDPReceiver(host, port, poll_timeout=poll_timeout, stale_after=stale_after)
 
     def frames(self, idle_timeout=None):
+        """Віддає і старі кадри (лише глибина і поза), і нові (з зображенням та
+        розрідженими точками). Поля `image` і `landmarks` для старих None."""
         for msg_type, _kind, msg_id, payload in self._rx.messages(idle_timeout=idle_timeout):
-            if msg_type != MSG_FRAME:
+            if msg_type == MSG_FRAME:
+                frame = decode_frame(payload)
+                frame["image"] = None
+                frame["landmarks"] = None
+            elif msg_type == MSG_FRAME2:
+                frame = decode_frame2(payload)
+            else:
                 continue
-            frame = decode_frame(payload)
             frame["frame_id"] = msg_id
+            frame["src_addr"] = self._rx.last_addr
             yield frame
 
     def close(self):
@@ -247,6 +399,64 @@ class GridSender:
         self.sock.close()
 
 
+class MapPublisher:
+    """Усе, що конвеєр віддає назовні в реальному часі, однією адресою:
+    покадрову 2D карту довіри, приріст воксельної карти і, за потреби, повну
+    сітку. Адреса окремішня від тієї, звідки приходять кадри, тому вхід і вихід
+    можуть бути на різних машинах."""
+
+    def __init__(self, host, port, chunk_size=1400, send_buf_size=4 * 1024 * 1024):
+        self.addr = (host, port)
+        self.chunk_size = chunk_size
+        self.sock = _make_socket(socket.SO_SNDBUF, send_buf_size)
+        self.bytes_sent = 0
+
+    def _send(self, msg_type, kind, msg_id, payload):
+        self.bytes_sent += len(payload)
+        _send_chunked(self.sock, self.addr, msg_type, kind, msg_id, payload, self.chunk_size)
+
+    def send_conf2d(self, frame_id, timestamp, confidence, depth=None, half=True):
+        self._send(MSG_CONF2D, 0, frame_id,
+                   encode_conf2d(timestamp, confidence, depth=depth, half=half))
+
+    def send_grid_delta(self, frame_id, grid, idx, values, timestamp=0.0):
+        self._send(MSG_GRID_DELTA, KIND_ADAPTIVE, frame_id,
+                   encode_grid_delta(grid.resolution, grid.origin, grid.dims, idx, values,
+                                      timestamp=timestamp))
+
+    def send_grid(self, frame_id, grid, kind="adaptive"):
+        kind_byte = {"naive": KIND_NAIVE, "weighted": KIND_WEIGHTED}.get(kind, KIND_ADAPTIVE)
+        self._send(MSG_GRID, kind_byte, frame_id, encode_grid(grid))
+
+    def close(self):
+        self.sock.close()
+
+
+class MapSubscriber:
+    """Приймає все, що шле MapPublisher. Кожне повідомлення віддається як
+    словник з полем `type`: conf2d, grid_delta або grid."""
+
+    def __init__(self, host, port, poll_timeout=0.5, stale_after=5.0):
+        self._rx = UDPReceiver(host, port, poll_timeout=poll_timeout, stale_after=stale_after)
+
+    def messages(self, idle_timeout=None):
+        for msg_type, kind, msg_id, payload in self._rx.messages(idle_timeout=idle_timeout):
+            if msg_type == MSG_CONF2D:
+                m = decode_conf2d(payload); m["type"] = "conf2d"
+            elif msg_type == MSG_GRID_DELTA:
+                m = decode_grid_delta(payload); m["type"] = "grid_delta"
+            elif msg_type == MSG_GRID:
+                m = decode_grid(payload); m["type"] = "grid"
+                m["kind"] = {KIND_NAIVE: "naive", KIND_WEIGHTED: "weighted"}.get(kind, "adaptive")
+            else:
+                continue
+            m["frame_id"] = msg_id
+            yield m
+
+    def close(self):
+        self._rx.close()
+
+
 class GridReceiver:
     """Consumer-side counterpart of GridSender -- e.g. a live viewer or the
     safety layer listening on the "other address" the maps get forwarded to."""
@@ -265,3 +475,185 @@ class GridReceiver:
 
     def close(self):
         self._rx.close()
+
+
+# ============================================================ транспорт по TCP
+#
+# Навіщо, якщо вже є UDP. Вимірювання: повідомлення ріжеться на шматки, і
+# втрата ОДНОГО губить усе повідомлення, бо повторів немає. При 1% втрат, що
+# для інтернету звичайна річ, кадр на 700 КБ доходить цілим у 0,7% випадків, а
+# 2D карта довіри у 15%. У локальній мережі втрат практично немає і UDP
+# правильний вибір, а через місто він просто не працює.
+#
+# TCP повторює втрачене сам. Платою є затримка на повторах і те, що одне
+# застрягле повідомлення притримує наступні. Для каналу через пів міста це
+# прийнятно, для бортового шару безпеки в локальній мережі ні, тому обидва
+# транспорти лишаються.
+#
+# Додаткова зручність: одне з'єднання несе ОБИДВА напрямки. Клієнт сам
+# під'єднується до сервера, тому NAT і брандмауер з боку клієнта не заважають,
+# і не треба ні окремого порту для відповіді, ні auto, ні ретранслятора.
+#
+# Кадр на дроті: magic, тип, різновид, номер, довжина, тіло зі стисненням zlib.
+
+_TCP_HDR = "!4sBBII"
+_TCP_HDR_SIZE = struct.calcsize(_TCP_HDR)
+
+
+def _tcp_send(sock, msg_type, kind, msg_id, payload):
+    body = zlib.compress(payload, level=1)
+    sock.sendall(struct.pack(_TCP_HDR, _MAGIC, msg_type, kind,
+                              msg_id & 0xFFFFFFFF, len(body)) + body)
+
+
+def _recv_exactly(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        part = sock.recv(min(65536, n - len(buf)))
+        if not part:
+            return None
+        buf += part
+    return bytes(buf)
+
+
+def _tcp_recv(sock):
+    head = _recv_exactly(sock, _TCP_HDR_SIZE)
+    if head is None:
+        return None
+    magic, msg_type, kind, msg_id, length = struct.unpack(_TCP_HDR, head)
+    if magic != _MAGIC:
+        raise ValueError("чужі дані у потоці")
+    body = _recv_exactly(sock, length)
+    if body is None:
+        return None
+    return msg_type, kind, msg_id, zlib.decompress(body)
+
+
+class TcpLink:
+    """Одне з'єднання, обидва напрямки. Безпечний для викликів з різних потоків
+    запис, бо відповіді шле потік обробки, а читає окремий."""
+
+    def __init__(self, sock, peer):
+        self.sock = sock
+        self.peer = peer
+        self._lock = threading.Lock()
+        self.bytes_sent = 0
+
+    def send(self, msg_type, kind, msg_id, payload):
+        with self._lock:
+            self.bytes_sent += len(payload)
+            _tcp_send(self.sock, msg_type, kind, msg_id, payload)
+
+    # ті самі назви, що в MapPublisher, щоб викликач не розрізняв транспорт
+    def send_conf2d(self, frame_id, timestamp, confidence, depth=None, half=True):
+        self.send(MSG_CONF2D, 0, frame_id,
+                  encode_conf2d(timestamp, confidence, depth=depth, half=half))
+
+    def send_grid_delta(self, frame_id, grid, idx, values, timestamp=0.0):
+        self.send(MSG_GRID_DELTA, KIND_ADAPTIVE, frame_id,
+                  encode_grid_delta(grid.resolution, grid.origin, grid.dims, idx, values,
+                                     timestamp=timestamp))
+
+    def send_grid(self, frame_id, grid, kind="adaptive"):
+        kind_byte = {"naive": KIND_NAIVE, "weighted": KIND_WEIGHTED}.get(kind, KIND_ADAPTIVE)
+        self.send(MSG_GRID, kind_byte, frame_id, encode_grid(grid))
+
+    def messages(self):
+        while True:
+            try:
+                got = _tcp_recv(self.sock)
+            except (OSError, ValueError, zlib.error):
+                return
+            if got is None:
+                return
+            yield got
+
+    def close(self):
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.sock.close()
+
+
+class TcpFrameServer:
+    """Слухає TCP і віддає кадри від усіх під'єднаних. Для кожного кадру
+    відомо, яким з'єднанням він прийшов, тому відповідь іде туди ж."""
+
+    def __init__(self, host, port, backlog=4):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((host, port))
+        self.sock.listen(backlog)
+        self.sock.settimeout(0.5)
+        self._stop = threading.Event()
+        self._queue = []
+        self._cv = threading.Condition()
+        self.links = []
+
+    def _serve(self, link):
+        try:
+            for msg_type, _kind, msg_id, payload in link.messages():
+                if msg_type == MSG_FRAME:
+                    fr = decode_frame(payload); fr["image"] = None; fr["landmarks"] = None
+                elif msg_type == MSG_FRAME2:
+                    fr = decode_frame2(payload)
+                else:
+                    continue
+                fr["frame_id"] = msg_id
+                fr["link"] = link
+                fr["src_addr"] = link.peer
+                with self._cv:
+                    self._queue.append(fr)
+                    self._cv.notify()
+        finally:
+            link.close()
+            if link in self.links:
+                self.links.remove(link)
+            print(f"[tcp] з'єднання з {link.peer[0]} закрите")
+
+    def _accept_loop(self):
+        while not self._stop.is_set():
+            try:
+                conn, peer = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            link = TcpLink(conn, peer)
+            self.links.append(link)
+            print(f"[tcp] під'єднався {peer[0]}:{peer[1]}")
+            threading.Thread(target=self._serve, args=(link,), daemon=True).start()
+
+    def start(self):
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+        return self
+
+    def frames(self, idle_timeout=None):
+        last = time.monotonic()
+        while not self._stop.is_set():
+            with self._cv:
+                if not self._queue:
+                    self._cv.wait(timeout=0.5)
+                if self._queue:
+                    fr = self._queue.pop(0)
+                    last = time.monotonic()
+                    yield fr
+                    continue
+            if idle_timeout and time.monotonic() - last > idle_timeout:
+                return
+
+    def close(self):
+        self._stop.set()
+        for l in list(self.links):
+            l.close()
+        self.sock.close()
+
+
+def tcp_connect(host, port, timeout=10.0):
+    """Клієнтський бік: одне з'єднання, яким ідуть і кадри, і відповіді."""
+    s = socket.create_connection((host, port), timeout=timeout)
+    s.settimeout(None)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return TcpLink(s, (host, port))

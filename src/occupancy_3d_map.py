@@ -47,6 +47,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 import numpy as np
 from PIL import Image
@@ -60,7 +61,7 @@ from compare_reconstruction_3d import (
     remap_pseudo_timestamps, load_vslam_stride, load_tum, find_depth_file, load_depth_frame,
 )
 from evo.core import sync as evo_sync
-from udp_streaming import FrameReceiver, GridSender
+from udp_streaming import FrameReceiver, GridSender, MapPublisher, TcpFrameServer
 import depth_calibration as depth_calib
 import depth_refine
 import gt_frame
@@ -133,6 +134,7 @@ class ProbabilisticVoxelGrid:
         # increments stop being assumed constants and become measurements of
         # how self-consistent THIS sensor chain actually is on THIS data.
         self.sensor_model = sensor_model
+        self.last_touched = np.zeros(0, dtype=np.int64)
 
     @property
     def _l_occ(self):
@@ -166,7 +168,14 @@ class ProbabilisticVoxelGrid:
         return np.where(contradicts, 1.0 / (1.0 + np.abs(l_prior) / self._tau), 1.0)
 
     def insert_weighted(self, points_world, weights, sensor_origin, sigma=None, n_ray_samples=-1,
-                         splat_k_sigma=1.5, splat_max_radius_voxels=4, splat_occupied=False):
+                         splat_k_sigma=1.5, splat_max_radius_voxels=4, splat_occupied=False,
+                         track_changes=False):
+        """track_changes: записати у self.last_touched плоскі індекси вокселів,
+        яких торкнувся цей виклик. Потрібне лише для потокового режиму, де
+        приріст за кадр треба віддати по мережі: інакше його довелося б
+        діставати копіюванням і порівнянням усього масиву, а це при сітці на
+        27 мільйонів вокселів чотири пересилки по 108 МБ на кадр. За
+        замовчуванням вимкнено, тобто поведінка не змінюється."""
         """sigma: optional per-point positional uncertainty (meters, same
         length as points_world). When given, a point's OCCUPIED contribution
         is spread with a Gaussian kernel over a neighborhood of radius
@@ -189,7 +198,11 @@ class ProbabilisticVoxelGrid:
         n_ray_samples: -1 (default) traverses each ray densely, one update
         per voxel actually crossed. A positive value keeps the old fixed
         sample count, for ablations."""
+        if track_changes:
+            self.last_touched = []
         if points_world.shape[0] == 0:
+            if track_changes:
+                self.last_touched = np.zeros(0, dtype=np.int64)
             return
         # Snapshot taken BEFORE this frame's update -- every point/ray in this
         # same call compares against the same prior, not a moving target as
@@ -208,6 +221,8 @@ class ProbabilisticVoxelGrid:
                 if self.use_consistency:
                     w_occ = w_occ * self._consistency_weight(snapshot[flat_occ], +1)
                 np.add.at(updated, flat_occ, self._l_occ * w_occ)
+                if track_changes:
+                    self.last_touched.append(flat_occ)
             else:
                 sigma_vox = np.maximum(sigma[mask], 0.0) / self.resolution
                 radius_vox = np.clip(np.ceil(splat_k_sigma * sigma_vox).astype(int), 0, splat_max_radius_voxels)
@@ -230,6 +245,8 @@ class ProbabilisticVoxelGrid:
                     if self.use_consistency:
                         all_w = all_w * self._consistency_weight(snapshot[flat], +1)
                     np.add.at(updated, flat, self._l_occ * all_w)
+                    if track_changes:
+                        self.last_touched.append(flat)
 
         pts = points_world[mask]
         w_masked = weights[mask]
@@ -273,6 +290,9 @@ class ProbabilisticVoxelGrid:
             ray_w = ray_w[keep_flat]
             if ray_pts.shape[0] == 0:
                 self.log_odds = np.clip(updated, self.l_min, self.l_max).reshape(self.dims)
+                if track_changes:
+                    self.last_touched = (np.unique(np.concatenate(self.last_touched))
+                                          if self.last_touched else np.zeros(0, dtype=np.int64))
                 return
 
             free_idx = self.world_to_voxel(ray_pts)
@@ -292,8 +312,13 @@ class ProbabilisticVoxelGrid:
                 if self.use_consistency:
                     ray_w = ray_w * self._consistency_weight(snapshot[flat_free], -1)
                 np.add.at(updated, flat_free, self._l_free * ray_w)
+                if track_changes:
+                    self.last_touched.append(flat_free)
 
         self.log_odds = np.clip(updated, self.l_min, self.l_max).reshape(self.dims)
+        if track_changes:
+            self.last_touched = (np.unique(np.concatenate(self.last_touched))
+                                  if self.last_touched else np.zeros(0, dtype=np.int64))
 
     def apply_decay(self, factor):
         """Pulls all log-odds toward 0 (unknown) by `factor` in [0,1] -- call
@@ -491,6 +516,7 @@ def build_arg_parser():
                           "(IoU 0.0233 -> 0.0088 as it tightened). Kept for the ORB-SLAM3 "
                           "per-frame landmark source, where anchor support is honest.")
     ap.add_argument("--blade_mask", default="../masks/blades_airsim.npz",
+                     nargs="?", const="",
                      help="drop the drone's own propellers (blade_mask.py) from EVERY variant and "
                           "from the GT reference -- they are part of the aircraft, not the scene. "
                           "Empty/absent mask = no effect (e.g. the Isaac Sim dataset has none).")
@@ -605,7 +631,9 @@ def build_arg_parser():
                       help="voxel grid upper corner, see --bounds_min")
     udp.add_argument("--sensor_yaml", help="EuRoC sensor.yaml for camera intrinsics, used when "
                                             "incoming frames don't carry their own K")
-    udp.add_argument("--send_host", help="if set, forward each frame's voxel grid to this "
+    udp.add_argument("--send_host", help="куди віддавати результат. Значення auto означає "
+                                          "відповідати тому, хто під'єднався, тобто на адресу "
+                                          "джерела кадрів. Інакше: forward each frame's voxel grid to this "
                                           "address -- separate from --listen_host/--listen_port, "
                                           "so input frames and output maps can go to/from "
                                           "different machines")
@@ -616,10 +644,62 @@ def build_arg_parser():
     udp.add_argument("--max_frames", type=int, default=None, help="stop after this many frames "
                                                                     "(default: run until Ctrl+C)")
     udp.add_argument("--idle_timeout", type=float, default=None,
-                      help="stop if no frame arrives for this many seconds (default: never)")
+                      help="зупинитись, якщо кадрів немає стільки секунд. 0 або не задано "
+                           "означає чекати вічно")
     udp.add_argument("--checkpoint_every", type=int, default=200,
                       help="also write naive_grid.npz/weighted_grid.npz to --output_dir every "
                            "N frames, not just on exit")
+    udp.add_argument("--transport", choices=["udp", "tcp"], default="udp",
+                      help="udp: швидко, без повторів, правильно для локальної мережі і борту. "
+                           "tcp: для каналу через інтернет. Виміряно, що при 1%% втрат кадр на "
+                           "700 КБ доходить цілим лише у 0,7%% випадків, бо втрата ОДНОГО "
+                           "шматка губить усе повідомлення. TCP повторює сам, а ще несе обидва "
+                           "напрямки ОДНИМ з'єднанням, тому клієнт за NAT під'єднується сам і "
+                           "ні ретранслятор, ні порт для відповіді не потрібні")
+    udp.add_argument("--chunk_size", type=int, default=1400,
+                      help="розмір шматка UDP. Через WireGuard або Tailscale брати 1200: "
+                           "1400 плюс заголовки плюс оболонка VPN перевищує MTU 1500 і дає "
+                           "мовчазні втрати")
+    udp.add_argument("--conf_scale", type=int, default=1,
+                      help="зменшити 2D карту довіри у N разів перед відправкою. На каналі з "
+                           "втратами це головний важіль: карта у чверть роздільності це 47 "
+                           "шматків замість 185, тобто при 1%% втрат доходить 62%% замість 16%%")
+    udp.add_argument("--rig_name",
+                      help="назва апарата для маски гвинтів, наприклад run1. Потрібна лише "
+                           "тоді, коли задано --blade_mask: маска описує гвинти ОДНОГО апарата "
+                           "і застосовується тільки до тих записів, на яких її міряли. Для "
+                           "нового апарата або без маски не потрібна зовсім. У режимі udp "
+                           "--dataset_root не потрібен: усі дані приходять по мережі")
+    udp.add_argument("--bounds_radius", type=float, default=None,
+                      help="замість --bounds_min/--bounds_max виділити сітку кубом зі стороною "
+                           "2R навколо ПЕРШОЇ отриманої пози. Для живого польоту це зручніше, "
+                           "бо межі сцени наперед невідомі. Сітка лишається нерухомою: якщо "
+                           "апарат вийде за неї, точки за межами просто не враховуються")
+    udp.add_argument("--publish", nargs="+", default=["conf2d", "delta"],
+                      choices=["conf2d", "delta", "grid", "none"],
+                      help="що віддавати на --send_host. conf2d це покадрова 2D карта довіри "
+                           "по пікселях, delta це лише ті вокселі, які змінив цей кадр, grid це "
+                           "вся сітка. Повна сітка на мільйони вокселів щокадру нікому не "
+                           "потрібна, тому типово conf2d і delta")
+    udp.add_argument("--publish_full_grid_every", type=int, default=0,
+                      help="додатково слати повну сітку кожні N кадрів, щоб новий підписник міг "
+                           "наздогнати стан. 0 означає ніколи")
+    udp.add_argument("--conf_float32", action="store_true",
+                      help="слати 2D карту довіри у float32 замість float16. Удвічі більше "
+                           "байтів заради значущих цифр, яких для величини від 0 до 1 не треба")
+    udp.add_argument("--publish_depth", action="store_true",
+                      help="класти у повідомлення conf2d ще й відкалібровану глибину, щоб "
+                           "споживач міг сам будувати точки")
+    udp.add_argument("--queue_frames", type=int, default=2,
+                      help="скільки кадрів тримати в черзі прийому. Обробка одного кадру триває "
+                           "сотні мілісекунд, тож при швидшому вхідному потоці черга "
+                           "переповнюється і НАЙСТАРІШІ кадри викидаються. 1 означає завжди "
+                           "працювати лише з найсвіжішим")
+    udp.add_argument("--stats_every", type=int, default=20,
+                      help="друкувати стан самоналаштовних величин кожні N кадрів")
+    udp.add_argument("--legacy_weighted", action="store_true",
+                      help="старий режим: замість ймовірнісного шару будувати weighted_grid за "
+                           "кривими з --error_model. Лишено для сумісності, не рекомендовано")
     udp.add_argument("--decay_half_life", type=float, default=None,
                       help="if set, pull log-odds toward unknown once per frame with this "
                            "half-life in seconds (uses each frame's own timestamp gap)")
@@ -1200,85 +1280,250 @@ def save_grids(output_dir, naive_grid, weighted_grid=None, adaptive_grid=None):
 
 
 def run_udp_mode(args):
-    if args.bounds_min is None or args.bounds_max is None:
-        raise SystemExit("--mode udp requires --bounds_min X Y Z and --bounds_max X Y Z -- "
-                          "the grid has to be allocated before any frames arrive")
+    """Сервер реального часу. Приймає кадри по UDP, будує карту довіри з
+    урахуванням усіх попередніх кадрів і віддає результат на окрему адресу.
+
+    Стан між кадрами тримає realtime_map.RealtimeConfidenceMapper: там і
+    самоналаштовні масштаби локального калібрування, і накопичена воксельна
+    сітка, і поріг узгодженості. Обробка одного кадру там викликає ті самі
+    функції, що й офлайновий режим."""
+    import realtime_map
+
+    if args.bounds_radius is None and (args.bounds_min is None or args.bounds_max is None):
+        raise SystemExit("--mode udp потребує або --bounds_radius R, або пари "
+                          "--bounds_min X Y Z і --bounds_max X Y Z: сітку треба виділити "
+                          "до того, як прийде перший кадр")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    pose_model = depth_model = None
-    if args.error_model:
-        with open(args.error_model) as f:
-            err = json.load(f)
-        pose_model, depth_model = err["pose_model"], err["depth_model"]
+    if isinstance(args.voxel_resolution, str):
+        if args.voxel_resolution in ("auto", "fine"):
+            raise SystemExit(f"--voxel_resolution {args.voxel_resolution} не працює в режимі "
+                              f"udp: обидва способи рахують розмір з УСІХ точок прогону, а в "
+                              f"реальному часі їх ще немає. Задай число, наприклад 1.0")
+        args.voxel_resolution = float(args.voxel_resolution)
+    if isinstance(args.max_depth, str):
+        if args.max_depth == "auto":
+            raise SystemExit("--max_depth auto не працює в режимі udp: межа рахується з усієї "
+                              "траєкторії. Задай число, наприклад 50")
+        args.max_depth = float(args.max_depth)
 
     K_default = load_camera_intrinsics(args.sensor_yaml)["K"] if args.sensor_yaml else None
+    # Єдине, для чого тут потрібне ім'я: вирішити, чи стосується цього апарата
+    # маска гвинтів. Жодних інших даних з диска потоковий режим не читає, усе
+    # інше приходить по мережі.
+    rig = args.rig_name or (os.path.basename(os.path.normpath(args.dataset_root))
+                             if args.dataset_root else None)
 
-    naive_grid = ProbabilisticVoxelGrid(args.bounds_min, args.bounds_max, args.voxel_resolution)
-    weighted_grid = ProbabilisticVoxelGrid(
-        args.bounds_min, args.bounds_max, args.voxel_resolution,
-        consistency_tau=args.consistency_tau, use_consistency=not args.no_consistency)
+    publish = set(args.publish) - {"none"}
+    tcp = args.transport == "tcp"
+    if tcp:
+        # Одне з'єднання несе обидва напрямки, тому ні окремого порту для
+        # відповіді, ні ретранслятора через NAT не потрібно: клієнт сам
+        # під'єднується до нас.
+        receiver = TcpFrameServer(args.listen_host, args.listen_port).start()
+        auto_send = True
+    else:
+        receiver = FrameReceiver(args.listen_host, args.listen_port)
+        auto_send = (args.send_host or "").lower() == "auto"
+    pub = (MapPublisher(args.send_host, args.send_port, chunk_size=args.chunk_size)
+           if (args.send_host and publish and not auto_send and not tcp) else None)
+    print(f"[udp] чекаю кадри на {args.listen_host}:{args.listen_port} "
+          f"({'TCP' if tcp else 'UDP'})")
+    if pub:
+        print(f"[udp] віддаю {', '.join(sorted(publish))} на {args.send_host}:{args.send_port}")
+    elif auto_send and tcp:
+        print(f"[udp] віддаю {', '.join(sorted(publish))} тим самим з'єднанням")
+    elif auto_send:
+        print(f"[udp] віддаю {', '.join(sorted(publish))} НАЗАД ТОМУ, хто під'єднався, "
+              f"порт {args.send_port}")
+    else:
+        print("[udp] --send_host не заданий, нічого не віддаю, лише будую карту")
 
-    receiver = FrameReceiver(args.listen_host, args.listen_port)
-    sender = GridSender(args.send_host, args.send_port) if args.send_host else None
-    print(f"[udp] listening for frames on {args.listen_host}:{args.listen_port}")
-    if sender:
-        print(f"[udp] forwarding '{args.send_grid}' grid every {args.send_every} frame(s) "
-              f"to {args.send_host}:{args.send_port}")
+    # Прийом в окремому потоці з чергою на --queue_frames. Один кадр
+    # обробляється сотні мілісекунд, і поки він обробляється, нові датаграми
+    # просто переповнюють буфер сокета і гинуть мовчки. З чергою втрата стає
+    # явною і керованою: беремо НАЙСВІЖІШИЙ кадр, а прострочені викидаємо і
+    # рахуємо. Для шару безпеки це правильна політика, бо застаріла карта
+    # гірша за пропущений кадр.
+    import collections
+    import threading
 
-    n_received = 0
+    inbox = collections.deque(maxlen=max(1, args.queue_frames))
+    inbox_lock = threading.Lock()
+    stop_rx = threading.Event()
+    dropped = [0]
+
+    def _rx_loop():
+        try:
+            for fr in receiver.frames(idle_timeout=args.idle_timeout):
+                with inbox_lock:
+                    if len(inbox) == inbox.maxlen:
+                        dropped[0] += 1
+                    inbox.append(fr)
+                if stop_rx.is_set():
+                    break
+        finally:
+            stop_rx.set()
+
+    rx_thread = threading.Thread(target=_rx_loop, daemon=True)
+    rx_thread.start()
+
+    def _next_frame():
+        while True:
+            with inbox_lock:
+                if inbox:
+                    return inbox.popleft()
+            if stop_rx.is_set():
+                return None
+            time.sleep(0.002)
+
+    mapper = None
+    n_received = n_with_conf = 0
     prev_timestamp = None
+    t_start = time.monotonic()
+    proc_times = []
+
     try:
-        for frame in receiver.frames(idle_timeout=args.idle_timeout):
+        while True:
+            frame = _next_frame()
+            if frame is None:
+                break
             K = frame["K"] if frame["K"] is not None else K_default
             if K is None:
-                print("[udp] skipping frame: no camera intrinsics (frame carried none and "
-                      "--sensor_yaml not given)")
+                print("[udp] кадр пропущено: немає параметрів камери ні в кадрі, ні в "
+                      "--sensor_yaml")
                 continue
 
-            depth = frame["depth"] * args.pred_depth_scale
-            T_wc = frame["T_wc"]
-            sigma_pose_val = float(eval_error_model(pose_model, np.array([frame["pose_x"]]))[0])
-            wm = legacy_weight_map(depth, sigma_pose_val, depth_model, args.w_ref)
-            pts, w = backproject_with_weight_map(depth, np.ones_like(depth), K, T_wc,
-                                                  args.min_depth, args.max_depth,
-                                                  max_points=args.max_points_per_frame)
-            pts_w, w_w = backproject_with_weight_map(depth, wm, K, T_wc, args.min_depth, args.max_depth,
-                                                      max_points=args.max_points_per_frame)
-            naive_grid.insert_weighted(pts, w, T_wc[:3, 3])
-            weighted_grid.insert_weighted(pts_w, w_w, T_wc[:3, 3])
+            if tcp:
+                pub = frame.get("link") if publish else None
+            elif auto_send and pub is None and frame.get("src_addr") and publish:
+                # Відповідаємо туди, звідки прийшов кадр. Для перевірки з іншої
+                # машини це знімає потребу знати її адресу наперед.
+                host = frame["src_addr"][0]
+                pub = MapPublisher(host, args.send_port, chunk_size=args.chunk_size)
+                print(f"[udp] джерело {host}, віддаю результат на {host}:{args.send_port}")
+
+            if mapper is None:
+                if args.bounds_radius is not None:
+                    c = np.asarray(frame["T_wc"], dtype=np.float64)[:3, 3]
+                    bmin = c - args.bounds_radius
+                    bmax = c + args.bounds_radius
+                    print(f"[udp] сітка {2*args.bounds_radius:.0f} м навколо першої пози "
+                          f"({c[0]:.1f}, {c[1]:.1f}, {c[2]:.1f}), воксель "
+                          f"{args.voxel_resolution} м")
+                else:
+                    bmin, bmax = np.array(args.bounds_min), np.array(args.bounds_max)
+                mapper = realtime_map.RealtimeConfidenceMapper(
+                    bmin, bmax, args.voxel_resolution,
+                    refiner_path=args.depth_refiner,
+                    refiner_min_validity=args.refiner_min_validity,
+                    blade_mask_path=args.blade_mask, blade_dataset_name=rig,
+                    use_sky_cue=args.sky_cue, sky_cue_percentile=args.sky_cue_percentile,
+                    calib_tile_px=args.calib_tile_px,
+                    calib_k_neighbors=args.calib_k_neighbors,
+                    calib_min_anchors_total=args.calib_min_anchors_total,
+                    calib_model=args.calib_model, max_anchor_gap=args.max_anchor_gap,
+                    pose_drift_rate=args.pose_drift_rate,
+                    min_depth=args.min_depth, max_depth=args.max_depth,
+                    max_points_per_frame=args.max_points_per_frame,
+                    n_ray_samples=args.n_ray_samples, splat=args.splat,
+                    splat_k_sigma=args.splat_k_sigma,
+                    splat_max_radius_voxels=args.splat_max_radius_voxels,
+                    consistency_tau=args.consistency_tau,
+                    use_consistency=not args.no_consistency)
+                print(f"[udp] сітка {'x'.join(str(int(d)) for d in mapper.adaptive_grid.dims)} вокселів")
+
+            t0 = time.monotonic()
+            res = mapper.process(frame["depth"], frame["T_wc"], K,
+                                  image=frame.get("image"), landmarks=frame.get("landmarks"),
+                                  pred_depth_scale=args.pred_depth_scale)
+            proc_times.append(time.monotonic() - t0)
+            n_received += 1
+
+            if res.get("confidence") is None:
+                if n_received <= 3 or n_received % args.stats_every == 0:
+                    print(f"[udp] кадр {frame['frame_id']}: {res.get('reason', 'без карти довіри')}")
+            else:
+                n_with_conf += 1
+                if pub:
+                    if "conf2d" in publish:
+                        conf_out = res["confidence"]
+                        if args.conf_scale > 1:
+                            k = args.conf_scale
+                            h2 = (conf_out.shape[0] // k) * k
+                            w2 = (conf_out.shape[1] // k) * k
+                            # середнє по блоку, але нечисла лишаються нечислами,
+                            # тобто відкинутий окіл лишається відкинутим
+                            blk = conf_out[:h2, :w2].reshape(h2 // k, k, w2 // k, k)
+                            # Блок, у якому ВСІ пікселі відкинуті, дає нечисло,
+                            # і це правильно, тому попередження тут зайве.
+                            with np.errstate(invalid="ignore"):
+                                import warnings
+                                with warnings.catch_warnings():
+                                    warnings.simplefilter("ignore", RuntimeWarning)
+                                    conf_out = np.nanmean(blk, axis=(1, 3))
+                        pub.send_conf2d(frame["frame_id"], frame["timestamp"],
+                                         conf_out,
+                                         depth=(res["depth_calibrated"]
+                                                if args.publish_depth and args.conf_scale == 1
+                                                else None),
+                                         half=not args.conf_float32)
+                    if "delta" in publish and len(res["delta_idx"]):
+                        pub.send_grid_delta(frame["frame_id"], mapper.adaptive_grid,
+                                             res["delta_idx"], res["delta_values"],
+                                             timestamp=frame["timestamp"])
+                if n_received % args.stats_every == 0:
+                    hz = n_received / max(time.monotonic() - t_start, 1e-9)
+                    print(f"[udp] кадр {n_received}: S={res['residual_scale']:.2f} м, "
+                          f"w сер.={res['mean_weight']:.3f}, у карту "
+                          f"{100*res['kept_fraction']:.0f}% пікселів, "
+                          f"змінено {len(res['delta_idx'])} вокселів, "
+                          f"{1000*np.mean(proc_times[-args.stats_every:]):.0f} мс/кадр, "
+                          f"вхід {hz:.1f} Гц")
+
+            if pub and "grid" in publish:
+                pub.send_grid(frame["frame_id"], mapper.adaptive_grid, kind="adaptive")
+            elif (pub and args.publish_full_grid_every
+                  and n_received % args.publish_full_grid_every == 0):
+                pub.send_grid(frame["frame_id"], mapper.adaptive_grid, kind="adaptive")
 
             if args.decay_half_life and prev_timestamp is not None:
                 dt = max(0.0, frame["timestamp"] - prev_timestamp)
                 factor = 1.0 - 0.5 ** (dt / args.decay_half_life)
-                naive_grid.apply_decay(factor)
-                weighted_grid.apply_decay(factor)
+                mapper.adaptive_grid.apply_decay(factor)
+                if mapper.naive_grid is not None:
+                    mapper.naive_grid.apply_decay(factor)
             prev_timestamp = frame["timestamp"]
 
-            n_received += 1
-            if sender and n_received % args.send_every == 0:
-                if args.send_grid in ("naive", "both"):
-                    sender.send_grid(frame["frame_id"], naive_grid, kind="naive")
-                if args.send_grid in ("weighted", "both"):
-                    sender.send_grid(frame["frame_id"], weighted_grid, kind="weighted")
-
             if args.checkpoint_every and n_received % args.checkpoint_every == 0:
-                save_grids(args.output_dir, naive_grid, weighted_grid)
+                save_grids(args.output_dir, mapper.naive_grid, None, mapper.adaptive_grid)
 
             if args.max_frames and n_received >= args.max_frames:
-                print(f"[udp] reached --max_frames {args.max_frames}, stopping")
+                print(f"[udp] досягнуто --max_frames {args.max_frames}, зупиняюсь")
                 break
     except KeyboardInterrupt:
-        print("\n[udp] stopped (Ctrl+C)")
+        print("\n[udp] зупинено (Ctrl+C)")
     finally:
+        stop_rx.set()
         receiver.close()
-        if sender:
-            sender.close()
+        if pub:
+            print(f"[udp] віддано {pub.bytes_sent/1e6:.1f} МБ")
+            pub.close()
 
-    save_grids(args.output_dir, naive_grid, weighted_grid)
-    print(f"[udp] fused {n_received} frames")
-    print(f"Naive occupied voxels:    {int(naive_grid.occupied_mask().sum())}")
-    print(f"Weighted occupied voxels: {int(weighted_grid.occupied_mask().sum())}")
-    print(f"Saved: {args.output_dir}/naive_grid.npz, weighted_grid.npz")
+    if mapper is None:
+        print("[udp] жодного кадру не отримано")
+        return
+    save_grids(args.output_dir, mapper.naive_grid, None, mapper.adaptive_grid)
+    print(f"\n[udp] оброблено {n_received} кадрів, з картою довіри {n_with_conf}, "
+          f"відкинуто як прострочені {dropped[0]}")
+    if proc_times:
+        t = np.array(proc_times) * 1000.0
+        print(f"[udp] час на кадр: медіана {np.median(t):.0f} мс, 95-й перцентиль "
+              f"{np.percentile(t, 95):.0f} мс, тобто межа близько "
+              f"{1000.0/max(np.median(t), 1e-9):.1f} Гц")
+    for k, v in mapper.summary().items():
+        print(f"[udp]   {k}: {v}")
+    print(f"[udp] збережено у {args.output_dir}")
 
 
 def main():
