@@ -45,7 +45,8 @@ _TCP_HDR_SIZE = struct.calcsize(_TCP_HDR)
 _MAGIC = b"OVM1"
 _HDR = "!4sBBIHHI"
 _HDR_SIZE = struct.calcsize(_HDR)
-MSG_FRAME2, MSG_CONF2D, MSG_GRID_DELTA, MSG_GRID = 3, 4, 5, 2
+MSG_FRAME2, MSG_CONF2D, MSG_GRID_DELTA, MSG_GRID, MSG_COMMAND = 3, 4, 5, 2, 6
+_CMD_FMT = "!d 3d 3d d d d B"
 F_HAS_K, F_HAS_IMAGE, F_HAS_LANDMARKS = 1, 2, 4
 F_HAS_DEPTH, F_HAS_POSE, F_IMAGE_RGB = 8, 16, 32
 
@@ -109,6 +110,12 @@ def _decode_grid_delta(payload):
             "idx": idx, "values": np.frombuffer(payload, np.float32, cnt, n + cnt * 12)}
 
 
+def _decode_command(payload):
+    v = struct.unpack(_CMD_FMT, payload[:struct.calcsize(_CMD_FMT)])
+    return {"timestamp": v[0], "direction": np.array(v[1:4]), "target": np.array(v[4:7]),
+            "speed": v[7], "clearance_m": v[8], "azimuth_deg": v[9], "stop": bool(v[10])}
+
+
 def _recv_exactly(sock, n):
     buf = bytearray()
     while len(buf) < n:
@@ -151,6 +158,8 @@ class TcpClient:
                     r = _decode_conf2d(body); r["type"] = "conf2d"
                 elif mtype == MSG_GRID_DELTA:
                     r = _decode_grid_delta(body); r["type"] = "grid_delta"
+                elif mtype == MSG_COMMAND:
+                    r = _decode_command(body); r["type"] = "command"
                 else:
                     continue
                 r["frame_id"] = mid
@@ -216,6 +225,8 @@ class Client:
                 r = _decode_conf2d(body); r["type"] = "conf2d"
             elif mtype == MSG_GRID_DELTA:
                 r = _decode_grid_delta(body); r["type"] = "grid_delta"
+            elif mtype == MSG_COMMAND:
+                r = _decode_command(body); r["type"] = "command"
             else:
                 continue
             r["frame_id"] = mid
@@ -283,7 +294,7 @@ def main():
         print(f"UDP на {args.host}:{args.port}, слухаю відповіді на :{args.listen_port}\n")
     print(f"{'кадр':>4}  {'надіслано':<24}  {'назад':<40}")
     print("-" * 74)
-    n_conf = n_delta = 0
+    n_conf = n_delta = n_cmd = 0
     for i in range(args.n):
         depth, T, K, grey, lm = synthetic(i)
         if args.scale > 1:
@@ -300,7 +311,11 @@ def main():
             sent = f"{depth.shape[1]}x{depth.shape[0]}, {len(lm)} точок"
         back = []
         for m in c.results(timeout=max(0.25, 1.0 / args.rate)):
-            if m["type"] == "conf2d":
+            if m["type"] == "command":
+                n_cmd += 1
+                back.append("СТОП" if m["stop"] else
+                            f"курс {m['azimuth_deg']:+.0f}°, {m['speed']:.1f} м/с")
+            elif m["type"] == "conf2d":
                 n_conf += 1
                 cf = m["confidence"]
                 back.append(f"карта довіри: {100*np.isfinite(cf).mean():.0f}% пікселів, "
@@ -312,11 +327,14 @@ def main():
     for m in c.results(timeout=3.0):
         if m["type"] == "conf2d":
             n_conf += 1
+        elif m["type"] == "command":
+            n_cmd += 1
         else:
             n_delta += 1
     c.close()
 
-    print(f"\nнадіслано {args.n}, повернулось карт довіри {n_conf}, приростів {n_delta}")
+    print(f"\nнадіслано {args.n}, повернулось карт довіри {n_conf}, приростів {n_delta}"
+          + (f", команд автопілота {n_cmd}" if n_cmd else ""))
     if n_conf:
         print("ЗВʼЯЗОК ПРАЦЮЄ В ОБИДВА БОКИ")
         return 0

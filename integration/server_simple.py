@@ -48,6 +48,7 @@ except AttributeError:
     pass
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+from autopilot import ReactiveAutopilot
 from realtime_map import RealtimeConfidenceMapper
 from udp_streaming import FrameReceiver, MapPublisher, TcpFrameServer
 
@@ -153,6 +154,14 @@ def main():
     ap.add_argument("--radius", type=float, default=60.0, help="радіус карти, м")
     ap.add_argument("--voxel", type=float, default=1.0, help="розмір вокселя, м")
     ap.add_argument("--max_depth", type=float, default=50.0)
+    ap.add_argument("--autopilot", action="store_true",
+                     help="рахувати ще й команду руху: напрямок, цільову точку і швидкість. "
+                          "Вона друкується і летить назад разом з картою")
+    ap.add_argument("--drone_radius", type=float, default=0.5)
+    ap.add_argument("--max_speed", type=float, default=3.0)
+    ap.add_argument("--cautious", action="store_true",
+                     help="з --autopilot: невідомі пікселі вважати можливою перешкодою, а не "
+                          "порожнечею. Обережніше, але повільніше")
     ap.add_argument("--save_to", default=None,
                      help="куди писати карту, наприклад ../live_map. Без цього не пише")
     args = ap.parse_args()
@@ -172,6 +181,13 @@ def main():
 
     mapper = None
     pub = None
+    pilot = (ReactiveAutopilot(drone_radius=args.drone_radius, max_speed=args.max_speed,
+                                unknown_is_risk=args.cautious)
+             if args.autopilot else None)
+    if pilot:
+        print(f"автопілот увімкнений, радіус апарата {args.drone_radius} м, "
+              f"до {args.max_speed} м/с, невідоме = "
+              f"{'ризик' if args.cautious else 'порожньо'}\n")
     n = 0
     t0 = time.monotonic()
 
@@ -237,9 +253,16 @@ def main():
                                          res["delta_idx"], res["delta_values"],
                                          timestamp=frame["timestamp"])
 
-            print(f"кадр {n:4d}  у карту {100*res['kept_fraction']:3.0f}% пікселів, "
-                  f"довіра {res['mean_weight']:.2f}, змінено {len(res['delta_idx']):5d} "
-                  f"вокселів, усього зайнято {int(mapper.adaptive_grid.occupied_mask().sum())}")
+            line = (f"кадр {n:4d}  у карту {100*res['kept_fraction']:3.0f}% пікселів, "
+                    f"довіра {res['mean_weight']:.2f}, змінено {len(res['delta_idx']):5d} "
+                    f"вокселів, усього зайнято "
+                    f"{int(mapper.adaptive_grid.occupied_mask().sum())}")
+            if pilot is not None:
+                cmd = pilot.step(res["confidence"], res["depth_calibrated"], K, T_wc)
+                if pub is not None:
+                    pub.send_command(frame["frame_id"], frame["timestamp"], cmd)
+                line += f"\n          автопілот: {pilot.reason(cmd)}"
+            print(line)
 
             if args.save_to and n % 25 == 0:
                 os.makedirs(args.save_to, exist_ok=True)

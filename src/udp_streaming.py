@@ -47,6 +47,7 @@ MSG_GRID = 2
 MSG_FRAME2 = 3      # кадр з зображенням і розрідженими точками VSLAM
 MSG_CONF2D = 4      # покадрова 2D карта довіри
 MSG_GRID_DELTA = 5  # лише вокселі, які змінив цей кадр
+MSG_COMMAND = 6     # команда автопілота на цей кадр
 KIND_NAIVE = 0
 KIND_WEIGHTED = 1
 KIND_ADAPTIVE = 2
@@ -326,6 +327,31 @@ def decode_conf2d(payload):
     return {"timestamp": timestamp, "confidence": conf, "depth": depth}
 
 
+# ------------------------------------------------- команда автопілота за кадр
+
+# мітка часу, напрямок, цільова точка, швидкість, запас, азимут, ознака стопу.
+# Пробіли struct ігнорує, зате видно, де що
+_CMD_FMT = "!d 3d 3d d d d B"
+
+
+def encode_command(timestamp, direction, target, speed, stop, clearance_m=0.0,
+                    azimuth_deg=0.0):
+    """Те, що шар безпеки віддає автопілоту: куди летіти і як швидко."""
+    d = np.ascontiguousarray(direction, dtype=np.float64).reshape(3)
+    t = np.ascontiguousarray(target, dtype=np.float64).reshape(3)
+    return struct.pack(_CMD_FMT, timestamp, *d.tolist(), *t.tolist(),
+                        float(speed), float(clearance_m), float(azimuth_deg),
+                        1 if stop else 0)
+
+
+def decode_command(payload):
+    v = struct.unpack(_CMD_FMT, payload[:struct.calcsize(_CMD_FMT)])
+    return {"timestamp": v[0],
+            "direction": np.array(v[1:4]), "target": np.array(v[4:7]),
+            "speed": v[7], "clearance_m": v[8], "azimuth_deg": v[9],
+            "stop": bool(v[10])}
+
+
 # ----------------------------------------------- приріст воксельної карти за кадр
 
 def encode_grid_delta(resolution, origin, dims, idx, values, timestamp=0.0):
@@ -455,6 +481,12 @@ class MapPublisher:
         kind_byte = {"naive": KIND_NAIVE, "weighted": KIND_WEIGHTED}.get(kind, KIND_ADAPTIVE)
         self._send(MSG_GRID, kind_byte, frame_id, encode_grid(grid))
 
+    def send_command(self, frame_id, timestamp, cmd):
+        self._send(MSG_COMMAND, 0, frame_id,
+                   encode_command(timestamp, cmd["direction"], cmd["target"], cmd["speed"],
+                                   cmd["stop"], cmd.get("clearance_m", 0.0),
+                                   cmd.get("azimuth_deg", 0.0)))
+
     def close(self):
         self.sock.close()
 
@@ -472,6 +504,8 @@ class MapSubscriber:
                 m = decode_conf2d(payload); m["type"] = "conf2d"
             elif msg_type == MSG_GRID_DELTA:
                 m = decode_grid_delta(payload); m["type"] = "grid_delta"
+            elif msg_type == MSG_COMMAND:
+                m = decode_command(payload); m["type"] = "command"
             elif msg_type == MSG_GRID:
                 m = decode_grid(payload); m["type"] = "grid"
                 m["kind"] = {KIND_NAIVE: "naive", KIND_WEIGHTED: "weighted"}.get(kind, "adaptive")
@@ -584,6 +618,12 @@ class TcpLink:
     def send_grid(self, frame_id, grid, kind="adaptive"):
         kind_byte = {"naive": KIND_NAIVE, "weighted": KIND_WEIGHTED}.get(kind, KIND_ADAPTIVE)
         self.send(MSG_GRID, kind_byte, frame_id, encode_grid(grid))
+
+    def send_command(self, frame_id, timestamp, cmd):
+        self.send(MSG_COMMAND, 0, frame_id,
+                  encode_command(timestamp, cmd["direction"], cmd["target"], cmd["speed"],
+                                  cmd["stop"], cmd.get("clearance_m", 0.0),
+                                  cmd.get("azimuth_deg", 0.0)))
 
     def messages(self):
         while True:
