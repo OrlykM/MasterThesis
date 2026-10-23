@@ -110,10 +110,23 @@ def _decode_grid_delta(payload):
             "idx": idx, "values": np.frombuffer(payload, np.float32, cnt, n + cnt * 12)}
 
 
+# Порядок елементів плоского вектора команди. Той самий у відправника і в
+# приймача, щоб не було розбіжності в індексах.
+COMMAND_FIELDS = ("timestamp", "dir_x", "dir_y", "dir_z",
+                  "target_x", "target_y", "target_z",
+                  "speed", "clearance_m", "azimuth_deg", "stop")
+
+
 def _decode_command(payload):
     v = struct.unpack(_CMD_FMT, payload[:struct.calcsize(_CMD_FMT)])
-    return {"timestamp": v[0], "direction": np.array(v[1:4]), "target": np.array(v[4:7]),
-            "speed": v[7], "clearance_m": v[8], "azimuth_deg": v[9], "stop": bool(v[10])}
+    vec = np.array([v[0], v[1], v[2], v[3], v[4], v[5], v[6],
+                    v[7], v[8], v[9], 1.0 if v[10] else 0.0], dtype=np.float64)
+    return {"timestamp": v[0], "direction": vec[1:4], "target": vec[4:7],
+            "speed": v[7], "clearance_m": v[8], "azimuth_deg": v[9], "stop": bool(v[10]),
+            # те саме одним масивом з 11 чисел, порядок у COMMAND_FIELDS
+            "vector": vec,
+            # і вже готовий вектор швидкості в м/с, при стопі чистий нуль
+            "velocity": vec[1:4] * v[7]}
 
 
 def _recv_exactly(sock, n):
@@ -295,6 +308,7 @@ def main():
     print(f"{'кадр':>4}  {'надіслано':<24}  {'назад':<40}")
     print("-" * 74)
     n_conf = n_delta = n_cmd = 0
+    last_vec = [None]
     for i in range(args.n):
         depth, T, K, grey, lm = synthetic(i)
         if args.scale > 1:
@@ -315,6 +329,7 @@ def main():
                 n_cmd += 1
                 back.append("СТОП" if m["stop"] else
                             f"курс {m['azimuth_deg']:+.0f}°, {m['speed']:.1f} м/с")
+                last_vec[0] = m["vector"]
             elif m["type"] == "conf2d":
                 n_conf += 1
                 cf = m["confidence"]
@@ -335,6 +350,11 @@ def main():
 
     print(f"\nнадіслано {args.n}, повернулось карт довіри {n_conf}, приростів {n_delta}"
           + (f", команд автопілота {n_cmd}" if n_cmd else ""))
+    if last_vec[0] is not None:
+        print("\nостанній вектор керування:")
+        print("  " + np.array2string(last_vec[0], precision=4, suppress_small=True,
+                                      max_line_width=200))
+        print("  " + "  ".join(f"{n}" for n in COMMAND_FIELDS))
     if n_conf:
         print("ЗВʼЯЗОК ПРАЦЮЄ В ОБИДВА БОКИ")
         return 0

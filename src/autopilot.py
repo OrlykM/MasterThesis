@@ -65,6 +65,46 @@ import numpy as np
 
 L_OCC = 0.85          # той самий приріст, що й у воксельній сітці
 
+# Плаский вигляд команди: 11 чисел, фіксований порядок. Зручно, коли
+# приймальний бік не хоче розбирати словник і просто читає масив.
+COMMAND_FIELDS = (
+    "timestamp",      # 0   мітка часу кадру, секунди
+    "dir_x",          # 1   напрямок руху, одиничний вектор
+    "dir_y",          # 2     у ТІЙ САМІЙ світовій системі, що й надіслана поза
+    "dir_z",          # 3
+    "target_x",       # 4   куди летіти, абсолютна точка у світі, метри
+    "target_y",       # 5
+    "target_z",       # 6
+    "speed",          # 7   бажана швидкість, м/с. Нуль означає стояти
+    "clearance_m",    # 8   вільна відстань попереду в обраному напрямку, м
+    "azimuth_deg",    # 9   відхилення від курсу: плюс праворуч, мінус ліворуч
+    "stop",           # 10  1 означає стоп, безпечного напрямку немає
+)
+
+
+def command_to_vector(cmd, timestamp=0.0):
+    """Словник команди -> масив з 11 чисел у порядку COMMAND_FIELDS."""
+    d = np.asarray(cmd["direction"], dtype=np.float64).reshape(3)
+    t = np.asarray(cmd["target"], dtype=np.float64).reshape(3)
+    return np.array([timestamp, d[0], d[1], d[2], t[0], t[1], t[2],
+                     float(cmd["speed"]), float(cmd.get("clearance_m", 0.0)),
+                     float(cmd.get("azimuth_deg", 0.0)),
+                     1.0 if cmd.get("stop") else 0.0], dtype=np.float64)
+
+
+def vector_to_command(v):
+    """Зворотне перетворення, щоб приймальний бік не плутав порядок."""
+    v = np.asarray(v, dtype=np.float64).reshape(11)
+    return {"timestamp": v[0], "direction": v[1:4], "target": v[4:7],
+            "speed": v[7], "clearance_m": v[8], "azimuth_deg": v[9],
+            "stop": bool(v[10] >= 0.5)}
+
+
+def velocity_vector(cmd):
+    """Якщо керуванню зручніше одразу вектор швидкості в м/с, а не
+    напрямок і модуль окремо."""
+    return np.asarray(cmd["direction"], dtype=np.float64).reshape(3) * float(cmd["speed"])
+
 
 class ReactiveAutopilot:
     def __init__(self,
@@ -116,12 +156,15 @@ class ReactiveAutopilot:
         self.last_direction_cam = None
         self.n_steps = 0
 
-        # Віяло кандидатів у системі камери: X праворуч, Y вниз, Z уперед.
+        # Віяло кандидатів у системі камери: X праворуч, Y ВНИЗ, Z уперед.
+        # Оскільки Y вниз, додатний кут місця дає ВІД'ЄМНИЙ y. Без мінуса
+        # звітний elevation_deg означав би протилежне загальноприйнятому, і
+        # той, хто читає команду, розвернув би апарат не туди.
         az = np.deg2rad(np.linspace(-max_azimuth_deg, max_azimuth_deg, n_azimuth))
         el = np.deg2rad(np.linspace(-max_elevation_deg, max_elevation_deg, n_elevation))
         A, E = np.meshgrid(az, el, indexing="ij")
         A, E = A.ravel(), E.ravel()
-        self.cand = np.stack([np.sin(A) * np.cos(E), np.sin(E), np.cos(A) * np.cos(E)], axis=1)
+        self.cand = np.stack([np.sin(A) * np.cos(E), -np.sin(E), np.cos(A) * np.cos(E)], axis=1)
         self.cand /= np.linalg.norm(self.cand, axis=1, keepdims=True)
         self.cand_az, self.cand_el = A, E
 

@@ -154,9 +154,9 @@ def main():
     ap.add_argument("--radius", type=float, default=60.0, help="радіус карти, м")
     ap.add_argument("--voxel", type=float, default=1.0, help="розмір вокселя, м")
     ap.add_argument("--max_depth", type=float, default=50.0)
-    ap.add_argument("--autopilot", action="store_true",
-                     help="рахувати ще й команду руху: напрямок, цільову точку і швидкість. "
-                          "Вона друкується і летить назад разом з картою")
+    ap.add_argument("--no_autopilot", action="store_true",
+                     help="не рахувати команду руху. Типово вона рахується і летить назад "
+                          "разом з картою як вектор з 11 чисел")
     ap.add_argument("--drone_radius", type=float, default=0.5)
     ap.add_argument("--max_speed", type=float, default=3.0)
     ap.add_argument("--cautious", action="store_true",
@@ -181,9 +181,9 @@ def main():
 
     mapper = None
     pub = None
-    pilot = (ReactiveAutopilot(drone_radius=args.drone_radius, max_speed=args.max_speed,
-                                unknown_is_risk=args.cautious)
-             if args.autopilot else None)
+    pilot = (None if args.no_autopilot else
+             ReactiveAutopilot(drone_radius=args.drone_radius, max_speed=args.max_speed,
+                                unknown_is_risk=args.cautious))
     if pilot:
         print(f"автопілот увімкнений, радіус апарата {args.drone_radius} м, "
               f"до {args.max_speed} м/с, невідоме = "
