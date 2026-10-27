@@ -433,6 +433,65 @@ class FrameReceiver:
         self._rx.close()
 
 
+_JPEG_SOI = b"\xff\xd8\xff"
+
+
+def extract_jpeg(data):
+    """Пакет може нести чужий короткий заголовок (номер кадру, часова мітка
+    тощо) перед самою картинкою -- шукаємо початок JPEG (SOI-маркер) і беремо
+    все від нього, байти перед ним ігноруються."""
+    i = data.find(_JPEG_SOI)
+    return None if i < 0 else data[i:]
+
+
+class RawJpegFrameReceiver:
+    """Для відправників, які НЕ використовують протокол OVM1 (FrameSender/
+    client.py), а просто шлють JPEG-картинку одним UDP-пакетом, можливо зі
+    своїм заголовком перед нею. Кожен пакет -- один кадр, без збирання
+    шматків: що влізло в один датаграм, те й є кадром.
+
+    Віддає той самий словник, що й FrameReceiver.frames(), з полями
+    depth/T_wc/K/landmarks порожніми -- їх рахує my_vslam_and_fde() на
+    сервері (чи заглушка --fake), так само, як для кадру "лише картинка",
+    надісланого через client.py."""
+
+    def __init__(self, host, port, poll_timeout=0.5):
+        self.sock = _make_socket(socket.SO_RCVBUF, 4 * 1024 * 1024)
+        self.sock.bind((host, port))
+        self.sock.settimeout(poll_timeout)
+        self._next_id = 0
+
+    def frames(self, idle_timeout=None):
+        import io
+        from PIL import Image
+
+        last_rx = time.monotonic()
+        while True:
+            try:
+                data, addr = self.sock.recvfrom(_MAX_DATAGRAM)
+            except socket.timeout:
+                if idle_timeout is not None and time.monotonic() - last_rx > idle_timeout:
+                    return
+                continue
+            last_rx = time.monotonic()
+
+            jpeg = extract_jpeg(data)
+            if jpeg is None:
+                continue
+            try:
+                image = np.array(Image.open(io.BytesIO(jpeg)).convert("RGB"))
+            except Exception:
+                continue
+
+            frame_id, self._next_id = self._next_id, self._next_id + 1
+            yield {"timestamp": time.time(), "K": None, "T_wc": None, "pose_x": 0.0,
+                   "depth": None, "image": image, "landmarks": None,
+                   "frame_id": frame_id, "src_addr": addr}
+
+    def close(self):
+        self.sock.close()
+
+
 class GridSender:
     """Sends one frame's voxel grid to a separate address than the one frames
     were received from -- a visualizer, logger, or the downstream safety
@@ -486,6 +545,12 @@ class MapPublisher:
                    encode_command(timestamp, cmd["direction"], cmd["target"], cmd["speed"],
                                    cmd["stop"], cmd.get("clearance_m", 0.0),
                                    cmd.get("azimuth_deg", 0.0)))
+
+    def send_raw(self, payload_bytes):
+        """Один пакет, без заголовка OVM1, без стиснення і без розбивки на
+        шматки -- для приймача, який не розбирає наш протокол і просто
+        чекає сирі байти (наприклад, 11 float64 вектора автопілота)."""
+        self.sock.sendto(payload_bytes, self.addr)
 
     def close(self):
         self.sock.close()

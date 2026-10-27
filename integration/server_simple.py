@@ -48,52 +48,79 @@ except AttributeError:
     pass
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
-from autopilot import ReactiveAutopilot
+from autopilot import ReactiveAutopilot, command_to_vector
 from realtime_map import RealtimeConfidenceMapper
-from udp_streaming import FrameReceiver, MapPublisher, TcpFrameServer
+from udp_streaming import FrameReceiver, MapPublisher, TcpFrameServer, RawJpegFrameReceiver
 
 
 # ===========================================================================
 #  ТУТ ТВІЙ КОД
 # ===========================================================================
 
+_zoedepth_pipe = [None]
+_vo_step = [0]
+_use_gpu = [False]      # виставляється з --gpu у main(), безпечний дефолт -- CPU
+
+
+def _get_zoedepth(use_gpu):
+    """Та сама модель, що й src/depth/zoedepth/infer.py -- завантажується
+    раз, при першому кадрі, а не на кожен виклик.
+
+    CPU за замовчуванням: на цій машині CUDA (torch) усередині WSL2
+    двічі поклала весь WSL -- dxgkrnl (віртуалізація GPU для WSL2) кидає
+    "field-spanning write" у dxgvmb_send_wait_sync_object_gpu і валить VM.
+    Це баг драйвера (Windows build 26200 + nvidia 610.57.01, обидва дуже
+    свіжі), не нашого коду. --gpu свідомо увімкне ризик ще раз."""
+    if _zoedepth_pipe[0] is None:
+        import torch
+        from transformers import pipeline
+        device_idx = 0 if (use_gpu and torch.cuda.is_available()) else -1
+        print(f"завантажую ZoeDepth ({'GPU -- ризик краху WSL!' if device_idx == 0 else 'CPU'})...")
+        _zoedepth_pipe[0] = pipeline("depth-estimation", model="Intel/zoedepth-nyu-kitti",
+                                      device=device_idx)
+        print("ZoeDepth завантажено\n")
+    return _zoedepth_pipe[0]
+
+
 def my_vslam_and_fde(image, have_depth, have_pose):
-    """Викликається на кожен кадр. Поверни те, чого в кадрі НЕ БУЛО.
-
-    На вході:
-        image       (H, W) або (H, W, 3) uint8, те, що прислали
-        have_depth  True, якщо глибина вже прийшла і рахувати її не треба
-        have_pose   True, якщо поза вже прийшла
-
-    Треба повернути словник. Клади в нього лише те, чого бракує:
-
-        {"depth":     (H, W) float32, метри,
-         "T_wc":      (4, 4) float64, перетворення камера -> світ, метри,
-         "K":         (3, 3) float64, матриця камери,
-         "landmarks": (N, 3) float32, розріджені точки VSLAM у СВІТОВИХ
-                      координатах, у тих самих метрах, що й T_wc}
-
-    Чого бракує найчастіше: `landmarks`. Це ті точки, за якими твій VSLAM
-    рахує своє положення. Саме вони дають масштаб, яким виправляється щільна
-    глибина від нейромережі. Без них сервер побудує карту зайнятості, але не
-    карту ДОВІРИ.
-
-    Приклад, як це виглядає з DPVO і ZoeDepth:
-
-        out = {}
-        if not have_depth:
-            out["depth"] = zoedepth_model.infer(image)        # метри
-        if not have_pose:
-            pose, points = dpvo.track(image)                  # твій VSLAM
-            out["T_wc"] = pose
-            out["landmarks"] = points
-        else:
-            out["landmarks"] = dpvo.current_map_points()
-        return out
+    """Жива глибина (ZoeDepth, та сама модель, що й в офлайн-конвеєрі),
+    поза ПОКИ фіктивна -- DPVO/ORB-SLAM3 не перероблені на покадровий
+    виклик (вони читають цілу теку кадрів наперед, а не один кадр по UDP).
+    Коли буде живий VSLAM, замінити блок `if not have_pose` на його виклик.
     """
-    raise NotImplementedError(
-        "Встав сюди свої VSLAM і FDE, або запусти з --fake, щоб спершу "
-        "перевірити зв'язок на заглушках")
+    from PIL import Image
+
+    out = {}
+    h, w = image.shape[:2]
+
+    if not have_depth:
+        pil_img = Image.fromarray(image if image.ndim == 3 else
+                                   np.stack([image] * 3, axis=-1)).convert("RGB")
+        pred = _get_zoedepth(_use_gpu[0])(pil_img)["predicted_depth"]
+        depth = pred.squeeze().cpu().numpy().astype(np.float32)
+        if depth.shape != (h, w):
+            depth = np.array(Image.fromarray(depth).resize((w, h), Image.BILINEAR))
+        out["depth"] = depth
+
+    fx = fy = 0.8 * w
+    cx, cy = w / 2.0, h / 2.0
+    out["K"] = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+
+    T = np.eye(4)
+    T[0, 3] = 0.3 * _vo_step[0]        # фіктивний рівномірний рух уздовж X
+    _vo_step[0] += 1
+    if not have_pose:
+        out["T_wc"] = T
+
+    d = out.get("depth")
+    if d is not None:
+        rng = np.random.default_rng(_vo_step[0])
+        vs = rng.integers(0, h, 300)
+        us = rng.integers(0, w, 300)
+        z = d[vs, us].astype(np.float64)
+        pc = np.stack([(us - cx) * z / fx, (vs - cy) * z / fy, z, np.ones_like(z)], axis=1)
+        out["landmarks"] = (T @ pc.T).T[:, :3].astype(np.float32)
+    return out
 
 
 # ===========================================================================
@@ -149,6 +176,11 @@ def main():
     ap.add_argument("--tcp", action="store_true",
                      help="через інтернет. Одне з'єднання в обидва боки, втрати "
                           "повторюються. У локальній мережі краще без нього")
+    ap.add_argument("--raw_jpeg", action="store_true",
+                     help="відправник шле НЕ протокол цього проекту (client.py), а просто "
+                          "JPEG-картинку одним UDP-пакетом, можливо зі своїм заголовком "
+                          "перед нею. Решта (depth/T_wc/K/landmarks) рахується як для "
+                          "кадру 'лише картинка' -- через my_vslam_and_fde() або --fake")
     ap.add_argument("--fake", action="store_true",
                      help="підставити заглушку замість твоїх VSLAM і FDE")
     ap.add_argument("--radius", type=float, default=60.0, help="радіус карти, м")
@@ -162,18 +194,43 @@ def main():
     ap.add_argument("--cautious", action="store_true",
                      help="з --autopilot: невідомі пікселі вважати можливою перешкодою, а не "
                           "порожнечею. Обережніше, але повільніше")
+    ap.add_argument("--raw_vector", action="store_true",
+                     help="приймач команди не розбирає протокол OVM1 -- слати йому замість "
+                          "цього один сирий пакет: 11 float64 підряд, порядок як у "
+                          "autopilot.COMMAND_FIELDS (timestamp, dir_x..z, target_x..z, speed, "
+                          "clearance_m, azimuth_deg, stop). На приймачі: "
+                          "np.frombuffer(data, dtype=np.float64)")
+    ap.add_argument("--vector_only", action="store_true",
+                     help="з --raw_vector: НЕ слати conf2d і grid_delta, лише сам вектор. "
+                          "Без цього на той самий порт 9001 ще й далі летить карта довіри "
+                          "й приріст вокселів у протоколі OVM1 -- якщо приймач читає з порту "
+                          "все підряд як 11 чисел, саме це і виглядає як 'фігня'")
     ap.add_argument("--save_to", default=None,
                      help="куди писати карту, наприклад ../live_map. Без цього не пише")
+    ap.add_argument("--show", action="store_true",
+                     help="відкрити вікно з останнім отриманим кадром (tkinter, живе у WSL "
+                          "через WSLg). Esc/закрити вікно -- зупиняє і сервер")
+    ap.add_argument("--gpu", action="store_true",
+                     help="рахувати ZoeDepth на GPU замість CPU. На цій машині двічі клало "
+                          "весь WSL (баг dxgkrnl, не нашого коду) -- вмикай свідомо, після "
+                          "'wsl --update' на Windows-боці, і май на увазі ризик")
     args = ap.parse_args()
 
     compute = fake_vslam_and_fde if args.fake else my_vslam_and_fde
+    _use_gpu[0] = args.gpu
     if args.fake:
         print("УВАГА: --fake, працюють заглушки, а не твої VSLAM і FDE\n")
+    elif args.gpu:
+        print("УВАГА: --gpu -- на цій машині це вже двічі клало весь WSL\n")
 
     if args.tcp:
         rx = TcpFrameServer("0.0.0.0", args.port).start()
         print(f"TCP, чекаю з'єднання на порту {args.port}")
         print("відповідь піде тим самим з'єднанням\n")
+    elif args.raw_jpeg:
+        rx = RawJpegFrameReceiver("0.0.0.0", args.port)
+        print(f"UDP (сирий JPEG, без протоколу OVM1), чекаю кадри на порту {args.port}")
+        print(f"карту віддаю на порт {args.reply_port} тому, хто під'єднався\n")
     else:
         rx = FrameReceiver("0.0.0.0", args.port)
         print(f"UDP, чекаю кадри на порту {args.port}")
@@ -191,13 +248,25 @@ def main():
     n = 0
     t0 = time.monotonic()
 
+    view = None
+    if args.show:
+        from live_view import LiveImageView
+        view = LiveImageView("вхідні кадри")
+
     try:
         for frame in rx.frames():
+            if view is not None and view.closed:
+                print("вікно закрито, зупиняюсь")
+                break
+
             image = frame.get("image")
             depth = frame.get("depth")
             T_wc = frame.get("T_wc")
             K = frame.get("K")
             landmarks = frame.get("landmarks")
+
+            if view is not None and image is not None:
+                view.show(image, status_text=f"кадр {n + 1}")
 
             if image is None and depth is None:
                 print("кадр без зображення і без глибини, пропускаю")
@@ -246,7 +315,7 @@ def main():
                 print(f"кадр {n}: {res.get('reason', 'карти довіри немає')}")
                 continue
 
-            if pub is not None:
+            if pub is not None and not args.vector_only:
                 pub.send_conf2d(frame["frame_id"], frame["timestamp"], res["confidence"])
                 if len(res["delta_idx"]):
                     pub.send_grid_delta(frame["frame_id"], mapper.adaptive_grid,
@@ -260,7 +329,11 @@ def main():
             if pilot is not None:
                 cmd = pilot.step(res["confidence"], res["depth_calibrated"], K, T_wc)
                 if pub is not None:
-                    pub.send_command(frame["frame_id"], frame["timestamp"], cmd)
+                    if args.raw_vector:
+                        vec = command_to_vector(cmd, timestamp=frame["timestamp"])
+                        pub.send_raw(vec.astype("<f8").tobytes())
+                    else:
+                        pub.send_command(frame["frame_id"], frame["timestamp"], cmd)
                 line += f"\n          автопілот: {pilot.reason(cmd)}"
             print(line)
 
@@ -274,6 +347,8 @@ def main():
         print("\nзупинено")
     finally:
         rx.close()
+        if view is not None:
+            view.close()
 
     if mapper is not None:
         dt = time.monotonic() - t0

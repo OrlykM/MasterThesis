@@ -26,6 +26,16 @@ WSL, ззовні недосяжний. Звичайний `netsh interface port
 
 Якщо Windows спитає про брандмауер, дозволити для приватних мереж.
 
+За замовчуванням ще й відкриває вікно з картинкою з кожного вхідного пакета,
+в якому знайшовся JPEG (шукає сигнатуру `FF D8 FF`, байти до неї, якщо є,
+просто ігноруються -- це може бути ваш власний короткий заголовок з
+номером кадру чи часовою міткою, на пересилання в WSL він не впливає).
+Вимкнути вікно: `--no-show`. Вийти і з вікна, і зі скрипта: Esc або `q` у
+вікні, або Ctrl+C у консолі.
+
+Потрібен `opencv-python` на Windows-боці (`pip install opencv-python`) лише
+для вікна -- без нього пересилання працює так само, просто без картинки.
+
 Зупинка: Ctrl+C.
 """
 import argparse
@@ -33,6 +43,22 @@ import socket
 import sys
 import threading
 import time
+
+try:
+    import cv2
+    import numpy as np
+    _HAVE_CV2 = True
+except ImportError:
+    _HAVE_CV2 = False
+
+_JPEG_SOI = b"\xff\xd8\xff"
+
+
+def extract_jpeg(data):
+    """Пакет може нести свій заголовок перед картинкою -- шукаємо початок
+    JPEG (SOI-маркер) і беремо все від нього, а не перші N байтів."""
+    i = data.find(_JPEG_SOI)
+    return None if i < 0 else data[i:]
 
 
 def pump(name, sock_in, target_getter, counter, verbose):
@@ -63,11 +89,21 @@ def main():
     ap.add_argument("--out-port", type=int, default=9001,
                      help="порт, на який сервер у WSL віддає карту довіри")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--no-show", action="store_true",
+                     help="не відкривати вікно з картинкою, лише пересилати")
     args = ap.parse_args()
+
+    show = (not args.no_show) and _HAVE_CV2
+    if not args.no_show and not _HAVE_CV2:
+        print("УВАГА: opencv-python не знайдено, вікно з картинкою вимкнене "
+              "(`pip install opencv-python`, щоб увімкнути). Пересилання це не чіпає.\n")
 
     client = [None]        # адреса того, хто шле кадри, з першого пакета
     n_in = [0, 0]
     n_out = [0, 0]
+    n_jpeg = [0]
+    latest_frame = [None]
+    frame_lock = threading.Lock()
 
     s_in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s_in.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
@@ -98,6 +134,18 @@ def main():
             except OSError as e:
                 print(f"[вхід] не вдалось переслати у WSL: {e}")
 
+            if show:
+                jpeg = extract_jpeg(data)
+                if jpeg is not None:
+                    try:
+                        img = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    except Exception:
+                        img = None
+                    if img is not None:
+                        n_jpeg[0] += 1
+                        with frame_lock:
+                            latest_frame[0] = img
+
     def forward_out():
         while True:
             try:
@@ -116,17 +164,39 @@ def main():
     threading.Thread(target=forward_in, daemon=True).start()
     threading.Thread(target=forward_out, daemon=True).start()
 
+    if show:
+        cv2.namedWindow("вхідні кадри", cv2.WINDOW_NORMAL)
+        print("вікно з картинкою: Esc або 'q' щоб закрити і вийти\n")
+
     try:
         last = (0, 0)
+        last_print = 0.0
         while True:
-            time.sleep(2.0)
-            if not args.quiet and (n_in[0], n_out[0]) != last:
+            if show:
+                with frame_lock:
+                    img = latest_frame[0]
+                if img is not None:
+                    cv2.setWindowTitle("вхідні кадри", f"вхідні кадри -- #{n_jpeg[0]}")
+                    cv2.imshow("вхідні кадри", img)
+                key = cv2.waitKey(30) & 0xFF
+                if key in (27, ord("q")):      # Esc або q
+                    print("\nзакрито з вікна")
+                    break
+            else:
+                time.sleep(2.0)
+
+            now = time.monotonic()
+            if not args.quiet and now - last_print >= 2.0 and (n_in[0], n_out[0]) != last:
+                jpeg_part = f", картинок {n_jpeg[0]}" if show else ""
                 print(f"  туди {n_in[0]} пакетів / {n_in[1]/1e6:.1f} МБ   "
-                      f"назад {n_out[0]} пакетів / {n_out[1]/1e6:.1f} МБ")
-                last = (n_in[0], n_out[0])
+                      f"назад {n_out[0]} пакетів / {n_out[1]/1e6:.1f} МБ{jpeg_part}")
+                last, last_print = (n_in[0], n_out[0]), now
     except KeyboardInterrupt:
         print(f"\nзупинено. Туди {n_in[0]} пакетів, назад {n_out[0]}")
-        return 0
+    finally:
+        if show:
+            cv2.destroyAllWindows()
+    return 0
 
 
 if __name__ == "__main__":
