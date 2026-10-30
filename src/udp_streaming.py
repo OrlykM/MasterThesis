@@ -133,6 +133,8 @@ class UDPReceiver:
         self.sock.settimeout(poll_timeout)
         self._reassembler = _Reassembler(stale_after=stale_after)
         self.last_addr = None
+        self._n_unparsed = self._n_foreign = 0
+        self._last_warn = 0.0
 
     def messages(self, idle_timeout=None):
         """Yields (msg_type, kind, msg_id, payload) as messages complete.
@@ -153,8 +155,24 @@ class UDPReceiver:
                 continue
             last_rx = time.monotonic()
             result = self._reassembler.ingest(packet)
-            if result is not None:
-                yield result
+            if result is None:
+                # Датаграма не з нашого протоколу або ще не зібралась. Перший
+                # випадок треба показати: інакше сервер мовчки ковтає сотні
+                # мегабайтів, а користувач бачить лише тишу і не розуміє, що
+                # відправник говорить іншою мовою.
+                self._n_unparsed += 1
+                if packet[:4] != _MAGIC:
+                    self._n_foreign += 1
+                    now = time.monotonic()
+                    if self._n_foreign in (1, 50) or now - self._last_warn > 5.0:
+                        self._last_warn = now
+                        kind = ("схоже на JPEG" if b"\xff\xd8\xff" in packet[:64]
+                                else "невідомий формат")
+                        print(f"[udp] УВАГА: {self._n_foreign} датаграм не з протоколу "
+                              f"OVM1 ({kind}), усі відкинуто. Якщо відправник шле голий "
+                              f"JPEG, перезапусти з --raw_jpeg")
+                continue
+            yield result
 
     def close(self):
         self.sock.close()
@@ -789,3 +807,4 @@ def tcp_connect(host, port, timeout=10.0):
     s.settimeout(None)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     return TcpLink(s, (host, port))
+

@@ -60,6 +60,8 @@ from udp_streaming import FrameReceiver, MapPublisher, TcpFrameServer, RawJpegFr
 _zoedepth_pipe = [None]
 _vo_step = [0]
 _use_gpu = [False]      # виставляється з --gpu у main(), безпечний дефолт -- CPU
+_dpvo_client = [None]
+_dpvo_addr = ["127.0.0.1", 8600]   # виставляється з --dpvo_host/--dpvo_port у main()
 
 
 def _get_zoedepth(use_gpu):
@@ -75,7 +77,7 @@ def _get_zoedepth(use_gpu):
         import torch
         from transformers import pipeline
         device_idx = 0 if (use_gpu and torch.cuda.is_available()) else -1
-        print(f"завантажую ZoeDepth ({'GPU -- ризик краху WSL!' if device_idx == 0 else 'CPU'})...")
+        print(f"завантажую ZoeDepth ({'GPU' if device_idx == 0 else 'CPU'})...")
         _zoedepth_pipe[0] = pipeline("depth-estimation", model="Intel/zoedepth-nyu-kitti",
                                       device=device_idx)
         print("ZoeDepth завантажено\n")
@@ -83,19 +85,24 @@ def _get_zoedepth(use_gpu):
 
 
 def my_vslam_and_fde(image, have_depth, have_pose):
-    """Жива глибина (ZoeDepth, та сама модель, що й в офлайн-конвеєрі),
-    поза ПОКИ фіктивна -- DPVO/ORB-SLAM3 не перероблені на покадровий
-    виклик (вони читають цілу теку кадрів наперед, а не один кадр по UDP).
-    Коли буде живий VSLAM, замінити блок `if not have_pose` на його виклик.
-    """
+    """Жива глибина (ZoeDepth, та сама модель, що й в офлайн-конвеєрі).
+
+    Поза: живий DPVO, якщо піднятий --dpvo (окремий процес у контейнері
+    thesis/dpvo, слухає TCP -- дивись src/slam/dpvo/live_dpvo_server.py),
+    інакше той самий фіктивний рівномірний рух, що й раніше.
+
+    Перші ~8 кадрів DPVO "розганяється" і T_wc ще None -- це очікувано,
+    сервер сам пропускає такі кадри (дивись `need`/перевірку нижче в main()).
+    Якщо з'єднання з живим DPVO обірветься -- падаємо назад у фіктивну
+    позу на ЦЕЙ кадр, а не валимо весь сервер."""
     from PIL import Image
 
     out = {}
     h, w = image.shape[:2]
+    image_rgb = image if image.ndim == 3 else np.stack([image] * 3, axis=-1)
 
     if not have_depth:
-        pil_img = Image.fromarray(image if image.ndim == 3 else
-                                   np.stack([image] * 3, axis=-1)).convert("RGB")
+        pil_img = Image.fromarray(image_rgb).convert("RGB")
         pred = _get_zoedepth(_use_gpu[0])(pil_img)["predicted_depth"]
         depth = pred.squeeze().cpu().numpy().astype(np.float32)
         if depth.shape != (h, w):
@@ -106,8 +113,25 @@ def my_vslam_and_fde(image, have_depth, have_pose):
     cx, cy = w / 2.0, h / 2.0
     out["K"] = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
 
+    if not have_pose:
+        dpvo_result = None
+        if _dpvo_client[0] is not None:
+            try:
+                T_wc, landmarks, initialized = _dpvo_client[0].track(
+                    _vo_step[0], image_rgb, out["K"])
+                dpvo_result = (T_wc, landmarks) if T_wc is not None else "warming_up"
+            except (ConnectionError, OSError) as e:
+                print(f"живий DPVO недоступний ({e}), фіктивна поза цей кадр")
+
+        if dpvo_result == "warming_up":
+            return out      # без T_wc -- сервер сам пропустить кадр, це нормально
+        if dpvo_result is not None:
+            out["T_wc"], out["landmarks"] = dpvo_result
+            _vo_step[0] += 1
+            return out
+
     T = np.eye(4)
-    T[0, 3] = 0.3 * _vo_step[0]        # фіктивний рівномірний рух уздовж X
+    T[0, 3] = 0.3 * _vo_step[0]        # фіктивний рівномірний рух уздовж X -- запасний варіант
     _vo_step[0] += 1
     if not have_pose:
         out["T_wc"] = T
@@ -211,17 +235,27 @@ def main():
                      help="відкрити вікно з останнім отриманим кадром (tkinter, живе у WSL "
                           "через WSLg). Esc/закрити вікно -- зупиняє і сервер")
     ap.add_argument("--gpu", action="store_true",
-                     help="рахувати ZoeDepth на GPU замість CPU. На цій машині двічі клало "
-                          "весь WSL (баг dxgkrnl, не нашого коду) -- вмикай свідомо, після "
-                          "'wsl --update' на Windows-боці, і май на увазі ризик")
+                     help="рахувати ZoeDepth на GPU замість CPU. Перевірено після оновлення "
+                          "драйвера NVIDIA (621.01) і 'wsl --update' -- баг dxgkrnl, що раніше "
+                          "двічі клав весь WSL на CUDA-навантаженні, більше не відтворюється")
+    ap.add_argument("--dpvo", action="store_true",
+                     help="жива поза через DPVO замість фіктивної. Потребує окремо піднятий "
+                          "контейнер з src/slam/dpvo/live_dpvo_server.py (дивись docstring "
+                          "там же для docker run). Без --dpvo чи якщо з'єднання обірветься -- "
+                          "фіктивна поза, як і раніше")
+    ap.add_argument("--dpvo_host", default="127.0.0.1")
+    ap.add_argument("--dpvo_port", type=int, default=8600)
     args = ap.parse_args()
 
     compute = fake_vslam_and_fde if args.fake else my_vslam_and_fde
     _use_gpu[0] = args.gpu
+    if args.dpvo and not args.fake:
+        from dpvo_client import DpvoClient
+        _dpvo_client[0] = DpvoClient(host=args.dpvo_host, port=args.dpvo_port)
+        print(f"жива поза: DPVO на {args.dpvo_host}:{args.dpvo_port} "
+              f"(перші ~8 кадрів піде фіктивна, поки DPVO розганяється)\n")
     if args.fake:
         print("УВАГА: --fake, працюють заглушки, а не твої VSLAM і FDE\n")
-    elif args.gpu:
-        print("УВАГА: --gpu -- на цій машині це вже двічі клало весь WSL\n")
 
     if args.tcp:
         rx = TcpFrameServer("0.0.0.0", args.port).start()
@@ -236,8 +270,27 @@ def main():
         print(f"UDP, чекаю кадри на порту {args.port}")
         print(f"карту віддаю на порт {args.reply_port} тому, хто під'єднався\n")
 
+    # явно сказати, що саме полетить на порт відповіді: саме через це
+    # приймач, який чекає рівно 88 байтів, бачить "received 1418 bytes"
+    if not args.tcp:
+        if args.vector_only and args.raw_vector:
+            print(f"на порт {args.reply_port} піде ЛИШЕ вектор керування, "
+                  f"88 байтів однією датаграмою, без протоколу OVM1")
+        else:
+            parts = ["карта довіри", "приріст вокселів"] if not args.vector_only else []
+            parts.append("голий вектор 88 байтів" if args.raw_vector
+                         else "команда керування")
+            print(f"на порт {args.reply_port} піде: {', '.join(parts)}")
+            if not args.vector_only:
+                print("  УВАГА: карта і приріст ідуть у протоколі OVM1, шматками по 1418 "
+                      "байтів.\n  Якщо приймач читає з порту все підряд як 11 чисел "
+                      "float64, він скаже\n  'expected 88 bytes, received 1418 bytes'. "
+                      "Тоді перезапусти з --raw_vector --vector_only")
+        print()
+
     mapper = None
     pub = None
+    skipped = [None, 0]        # остання причина пропуску і скільки кадрів поспіль
     pilot = (None if args.no_autopilot else
              ReactiveAutopilot(drone_radius=args.drone_radius, max_speed=args.max_speed,
                                 unknown_is_risk=args.cautious))
@@ -312,8 +365,22 @@ def main():
                 print(f"відповідаю на {frame['src_addr'][0]}:{args.reply_port}\n")
 
             if res.get("confidence") is None:
-                print(f"кадр {n}: {res.get('reason', 'карти довіри немає')}")
+                # та сама причина поспіль -- друкуємо першу і далі раз на 50
+                # кадрів з лічильником, інакше лог заливає однаковими рядками
+                reason = res.get("reason", "карти довіри немає")
+                key = reason.split(".")[0]
+                if key == skipped[0]:
+                    skipped[1] += 1
+                    if skipped[1] % 50 == 0:
+                        print(f"кадр {n}: та сама причина вже {skipped[1]} кадрів поспіль")
+                else:
+                    skipped[0], skipped[1] = key, 1
+                    print(f"кадр {n}: {reason}")
                 continue
+            if skipped[1]:
+                print(f"кадр {n}: карта довіри знову будується "
+                      f"(пропущено {skipped[1]} кадрів поспіль)")
+                skipped[0], skipped[1] = None, 0
 
             if pub is not None and not args.vector_only:
                 pub.send_conf2d(frame["frame_id"], frame["timestamp"], res["confidence"])

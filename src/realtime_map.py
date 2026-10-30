@@ -123,6 +123,41 @@ class RealtimeConfidenceMapper:
 
     # -------------------------------------------------------------- один кадр
 
+    def _why_no_anchors(self, landmarks, T_wc, K, w, h):
+        """Чому жодна точка VSLAM не дійшла до кадру. Кличеться лише тоді,
+        коли опорних точок нуль, тому на швидкодію не впливає.
+
+        Розбиває втрати на чотири причини, які виключають одна одну, у тому
+        самому порядку, у якому їх відсіює depth_calib.project_points:
+        позаду камери, ближче за min_depth, далі за max_depth, за межами
+        кадру. Та, у якій майже всі точки, і є справжня причина."""
+        p = np.asarray(landmarks, dtype=np.float64)
+        n = len(p)
+        if n == 0:
+            return "точок не було взагалі"
+        cam = (np.linalg.inv(T_wc) @ np.concatenate(
+            [p, np.ones((n, 1))], axis=1).T).T[:, :3]
+        z = cam[:, 2]
+        behind = z <= 0
+        near = (~behind) & (z <= self.min_depth)
+        far = (~behind) & (z >= self.max_depth)
+        live = (~behind) & (~near) & (~far)
+        out_of_frame = np.zeros(n, dtype=bool)
+        if live.any():
+            fx, fy = K[0, 0], K[1, 1]
+            cx, cy = K[0, 2], K[1, 2]
+            u = fx * cam[live, 0] / z[live] + cx
+            v = fy * cam[live, 1] / z[live] + cy
+            out_of_frame[live] = (u < 0) | (u > w - 1) | (v < 0) | (v > h - 1)
+        parts = [f"позаду камери {int(behind.sum())}",
+                 f"ближче за {self.min_depth:g} м {int(near.sum())}",
+                 f"далі за {self.max_depth:g} м {int(far.sum())}",
+                 f"за межами кадру {int(out_of_frame.sum())}"]
+        zq = np.percentile(z, [5, 50, 95]) if n else [0, 0, 0]
+        return (f"з {n} точок: " + ", ".join(parts) +
+                f". Глибина точок у камері: 5% {zq[0]:.2f}, медіана {zq[1]:.2f}, "
+                f"95% {zq[2]:.2f} (одиниці VSLAM, не обов'язково метри)")
+
     def process(self, depth, T_wc, K, image=None, landmarks=None, pred_depth_scale=1.0):
         """-> словник з картою довіри, відкаліброваною глибиною, точками і
         приростом воксельної карти. Жодних побічних записів на диск."""
@@ -186,6 +221,8 @@ class RealtimeConfidenceMapper:
             out["anchors_in_view"] = int(len(au))
             out["reason"] = (f"у кадрі лише {len(au)} опорних точок, менше за мінімум "
                               f"{self.local_calib.min_anchors_total}: калібрування пропущено")
+            if len(au) == 0:
+                out["reason"] += ". " + self._why_no_anchors(landmarks, T_wc, K, w, h)
             return out
 
         alpha_map, beta_map, conf_map, sigma_depth_map, support_map = result
