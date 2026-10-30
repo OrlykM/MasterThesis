@@ -239,6 +239,13 @@ def main():
                           "все підряд як 11 чисел, саме це і виглядає як 'фігня'")
     ap.add_argument("--save_to", default=None,
                      help="куди писати карту, наприклад ../live_map. Без цього не пише")
+    ap.add_argument("--up_axis", type=int, default=2, choices=(0, 1, 2),
+                     help="яка вісь світу вертикальна, для вигляду згори у --show_map. "
+                          "У наборах цього проєкту це Z, тобто 2")
+    ap.add_argument("--show_map", action="store_true",
+                     help="вікно на три панелі: кадр, карта довіри цього кадру і "
+                          "накопичена карта зайнятості згори. Права панель "
+                          "заповнюється лише тоді, коли є опорні точки VSLAM")
     ap.add_argument("--show", action="store_true",
                      help="відкрити вікно з останнім отриманим кадром (tkinter, живе у WSL "
                           "через WSLg). Esc/закрити вікно -- зупиняє і сервер")
@@ -360,12 +367,19 @@ def main():
     t0 = time.monotonic()
 
     view = None
+    map_view = None
+    if args.show_map:
+        from live_map_view import LiveMapView
+        map_view = LiveMapView()
     if args.show:
         from live_view import LiveImageView
         view = LiveImageView("вхідні кадри")
 
     try:
         for frame in rx.frames():
+            if map_view is not None and map_view.closed:
+                print("вікно закрито, зупиняюсь")
+                break
             if view is not None and view.closed:
                 print("вікно закрито, зупиняюсь")
                 break
@@ -458,6 +472,11 @@ def main():
                     print(f"кадр {n}: {reason}")
                 emit_bootstrap(frame, res.get("depth_calibrated", depth), K, T_wc,
                                 "немає карти довіри")
+                if map_view is not None:
+                    map_view.show(image, None, mapper.adaptive_grid,
+                                   np.asarray(T_wc, dtype=np.float64)[:3, 3],
+                                   status_text=f"кадр {n}: {reason[:90]}",
+                                   up_axis=args.up_axis)
                 continue
             if skipped[1]:
                 print(f"кадр {n}: карта довіри знову будується "
@@ -480,6 +499,13 @@ def main():
                 cmd = pilot.step(res["confidence"], res["depth_calibrated"], K, T_wc)
                 emit(cmd, frame)
                 line += f"\n          автопілот: {pilot.reason(cmd)}"
+            if map_view is not None:
+                map_view.show(image, res["confidence"], mapper.adaptive_grid,
+                               np.asarray(T_wc, dtype=np.float64)[:3, 3],
+                               status_text=(f"кадр {n}  довіра {res['mean_weight']:.2f}  "
+                                            f"зайнято вокселів "
+                                            f"{int(mapper.adaptive_grid.occupied_mask().sum())}"),
+                               up_axis=args.up_axis)
             print(line)
 
             if args.save_to and n % 25 == 0:
@@ -494,6 +520,8 @@ def main():
         rx.close()
         if view is not None:
             view.close()
+        if map_view is not None:
+            map_view.close()
 
     if mapper is not None:
         dt = time.monotonic() - t0
