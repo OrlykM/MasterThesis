@@ -299,6 +299,7 @@ def main():
     mapper = None
     pub = None
     skipped = [None, 0]        # остання причина пропуску і скільки кадрів поспіль
+    pub_addr = [None]          # кому відповідаємо, щоб ловити зміну джерела
     pilot = (None if args.no_autopilot else
              ReactiveAutopilot(drone_radius=args.drone_radius, max_speed=args.max_speed,
                                 unknown_is_risk=args.cautious))
@@ -382,9 +383,20 @@ def main():
             #     треба слати саме на тих кадрах, які далі пропускаються ---
             if args.tcp:
                 pub = frame.get("link")
-            elif pub is None and frame.get("src_addr"):
-                pub = MapPublisher(frame["src_addr"][0], args.reply_port)
-                print(f"відповідаю на {frame['src_addr'][0]}:{args.reply_port}\n")
+            elif frame.get("src_addr"):
+                # Адресу беремо з кадру і ПЕРЕНАЦІЛЮЄМО, якщо джерело
+                # змінилось. Інакше перший же сторонній пакет на порт кадрів
+                # назавжди забирає собі відповіді, і справжній клієнт потім
+                # не отримує нічого, хоча сервер працює.
+                src = frame["src_addr"][0]
+                if src != pub_addr[0]:
+                    if pub_addr[0] is not None:
+                        print(f"джерело кадрів змінилось: {pub_addr[0]} -> {src}, "
+                              f"відповіді йдуть тепер туди")
+                    else:
+                        print(f"відповідаю на {src}:{args.reply_port}\n")
+                    pub = MapPublisher(src, args.reply_port)
+                    pub_addr[0] = src
 
             if image is None and depth is None:
                 print("кадр без зображення і без глибини, пропускаю")
