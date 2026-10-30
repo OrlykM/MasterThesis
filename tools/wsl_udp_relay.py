@@ -54,6 +54,17 @@ except ImportError:
 _JPEG_SOI = b"\xff\xd8\xff"
 
 
+def human(n):
+    """Байти так, щоб 240 пакетів по 88 байтів не виглядали як "0.0 МБ"
+    і не сходили за збій. Голий вектор керування це саме 88 байтів, тому
+    зворотний потік тут законно мізерний."""
+    if n < 1024:
+        return f"{n} Б"
+    if n < 1024 * 1024:
+        return f"{n/1024:.1f} КБ"
+    return f"{n/1e6:.1f} МБ"
+
+
 def extract_jpeg(data):
     """Пакет може нести свій заголовок перед картинкою -- шукаємо початок
     JPEG (SOI-маркер) і беремо все від нього, а не перші N байтів."""
@@ -188,8 +199,9 @@ def main():
             now = time.monotonic()
             if not args.quiet and now - last_print >= 2.0 and (n_in[0], n_out[0]) != last:
                 jpeg_part = f", картинок {n_jpeg[0]}" if show else ""
-                print(f"  туди {n_in[0]} пакетів / {n_in[1]/1e6:.1f} МБ   "
-                      f"назад {n_out[0]} пакетів / {n_out[1]/1e6:.1f} МБ{jpeg_part}")
+                rate = f"  1 вектор на {n_in[0] // n_out[0]} кадрів" if n_out[0] else ""
+                print(f"  туди {n_in[0]} пакетів / {human(n_in[1])}   "
+                      f"назад {n_out[0]} пакетів / {human(n_out[1])}{jpeg_part}{rate}")
                 last, last_print = (n_in[0], n_out[0]), now
     except KeyboardInterrupt:
         print(f"\nзупинено. Туди {n_in[0]} пакетів, назад {n_out[0]}")
