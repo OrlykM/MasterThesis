@@ -218,6 +218,14 @@ def main():
     ap.add_argument("--cautious", action="store_true",
                      help="з --autopilot: невідомі пікселі вважати можливою перешкодою, а не "
                           "порожнечею. Обережніше, але повільніше")
+    ap.add_argument("--no_bootstrap", dest="bootstrap", action="store_false",
+                     help="НЕ слати розгінну команду на кадрах без карти довіри. "
+                          "Тоді на таких кадрах на порт відповіді не йде нічого, і "
+                          "якщо апарат чекає команду, щоб рушити, він так і не рушить, "
+                          "а монокулярний VSLAM без руху не дасть опорних точок")
+    ap.add_argument("--bootstrap_speed", type=float, default=0.5,
+                     help="межа швидкості для розгінних команд, м/с. Вони будуються "
+                          "з сирої глибини без калібрування, тому свідомо повільні")
     ap.add_argument("--raw_vector", action="store_true",
                      help="приймач команди не розбирає протокол OVM1 -- слати йому замість "
                           "цього один сирий пакет: 11 float64 підряд, порядок як у "
@@ -294,10 +302,59 @@ def main():
     pilot = (None if args.no_autopilot else
              ReactiveAutopilot(drone_radius=args.drone_radius, max_speed=args.max_speed,
                                 unknown_is_risk=args.cautious))
+
+    # Розгінний автопілот. Монокулярний VSLAM не дає опорних точок, поки
+    # апарат стоїть, бо без руху немає паралаксу і тріангулювати нічого. А
+    # апарат стоїть, поки не прийде команда. Без цього виходить замкнене
+    # коло: карти довіри немає -> команди немає -> руху немає -> карти немає.
+    #
+    # Тому на кадрах, де довіри ще немає, команда будується з СИРОЇ глибини
+    # FDE, кожен піксель якої вважається невідомим, а невідоме ризиком. Це
+    # не метод роботи, а лише спосіб зрушити з місця: швидкість обмежена
+    # --bootstrap_speed, і щойно з'являються опорні точки, керування
+    # переходить до звичайного автопілота.
+    pilot_boot = None
+    if pilot is not None and args.bootstrap:
+        pilot_boot = ReactiveAutopilot(drone_radius=args.drone_radius,
+                                        max_speed=args.bootstrap_speed,
+                                        unknown_is_risk=True)
+    boot_sent = [0]
+
+    def emit(cmd, frame):
+        """Команда на порт відповіді. Один шлях для бойових і розгінних."""
+        if pub is None:
+            return
+        if args.raw_vector:
+            pub.send_raw(command_to_vector(
+                cmd, timestamp=frame["timestamp"]).astype("<f8").tobytes())
+        else:
+            pub.send_command(frame["frame_id"], frame["timestamp"], cmd)
+
+    def emit_bootstrap(frame, depth, K, T_wc, why):
+        """Рушій розгону: сира глибина, нуль довіри, мала швидкість."""
+        if pilot_boot is None or depth is None or K is None:
+            return False
+        T = np.eye(4) if T_wc is None else np.asarray(T_wc, dtype=np.float64)
+        conf = np.full(np.shape(depth), np.nan)      # усе невідоме
+        cmd = pilot_boot.step(conf, depth, K, T)
+        emit(cmd, frame)
+        boot_sent[0] += 1
+        if boot_sent[0] == 1 or boot_sent[0] % 50 == 0:
+            print(f"          розгін #{boot_sent[0]} ({why}): "
+                  f"{pilot_boot.reason(cmd)}")
+        return True
     if pilot:
         print(f"автопілот увімкнений, радіус апарата {args.drone_radius} м, "
               f"до {args.max_speed} м/с, невідоме = "
-              f"{'ризик' if args.cautious else 'порожньо'}\n")
+              f"{'ризик' if args.cautious else 'порожньо'}")
+        if pilot_boot is not None:
+            print(f"розгін увімкнений: поки опорних точок VSLAM немає, команда "
+                  f"будується з сирої глибини, до {args.bootstrap_speed} м/с.\n"
+                  f"  Це потрібно, щоб апарат зрушив: без руху монокулярний VSLAM "
+                  f"не дасть опорних точок.\n  Вимкнути: --no_bootstrap")
+        else:
+            print("розгін вимкнений: на кадрах без карти довіри команда не йде")
+        print()
     n = 0
     t0 = time.monotonic()
 
@@ -321,6 +378,14 @@ def main():
             if view is not None and image is not None:
                 view.show(image, status_text=f"кадр {n + 1}")
 
+            # --- куди відповідати: до пропусків, бо розгінні команди
+            #     треба слати саме на тих кадрах, які далі пропускаються ---
+            if args.tcp:
+                pub = frame.get("link")
+            elif pub is None and frame.get("src_addr"):
+                pub = MapPublisher(frame["src_addr"][0], args.reply_port)
+                print(f"відповідаю на {frame['src_addr'][0]}:{args.reply_port}\n")
+
             if image is None and depth is None:
                 print("кадр без зображення і без глибини, пропускаю")
                 continue
@@ -336,7 +401,17 @@ def main():
                 landmarks = landmarks if landmarks is not None else extra.get("landmarks")
 
             if depth is None or T_wc is None or K is None:
-                print("після обробки все одно немає глибини, пози або K, пропускаю кадр")
+                missing = [nm for nm, v in (("глибини", depth), ("пози", T_wc),
+                                             ("K", K)) if v is None]
+                first = skipped[0] != "no_pose"
+                if first:
+                    skipped[0], skipped[1] = "no_pose", 1
+                    print(f"немає {' і '.join(missing)}, у карту кадр не йде"
+                          + (", йде розгінна команда" if pilot_boot else ""))
+                else:
+                    skipped[1] += 1
+                emit_bootstrap(frame, depth, K, None,
+                                "немає " + " і ".join(missing))
                 continue
 
             # --- сітка виділяється за першою позою ------------------------
@@ -357,13 +432,6 @@ def main():
             res = mapper.process(depth, T_wc, K, image=grey, landmarks=landmarks)
             n += 1
 
-            # --- куди відповідати ------------------------------------------
-            if args.tcp:
-                pub = frame.get("link")
-            elif pub is None and frame.get("src_addr"):
-                pub = MapPublisher(frame["src_addr"][0], args.reply_port)
-                print(f"відповідаю на {frame['src_addr'][0]}:{args.reply_port}\n")
-
             if res.get("confidence") is None:
                 # та сама причина поспіль -- друкуємо першу і далі раз на 50
                 # кадрів з лічильником, інакше лог заливає однаковими рядками
@@ -376,10 +444,13 @@ def main():
                 else:
                     skipped[0], skipped[1] = key, 1
                     print(f"кадр {n}: {reason}")
+                emit_bootstrap(frame, res.get("depth_calibrated", depth), K, T_wc,
+                                "немає карти довіри")
                 continue
             if skipped[1]:
                 print(f"кадр {n}: карта довіри знову будується "
-                      f"(пропущено {skipped[1]} кадрів поспіль)")
+                      f"(пропущено кадрів поспіль: {skipped[1]}, "
+                      f"розгінних команд: {boot_sent[0]})")
                 skipped[0], skipped[1] = None, 0
 
             if pub is not None and not args.vector_only:
@@ -395,12 +466,7 @@ def main():
                     f"{int(mapper.adaptive_grid.occupied_mask().sum())}")
             if pilot is not None:
                 cmd = pilot.step(res["confidence"], res["depth_calibrated"], K, T_wc)
-                if pub is not None:
-                    if args.raw_vector:
-                        vec = command_to_vector(cmd, timestamp=frame["timestamp"])
-                        pub.send_raw(vec.astype("<f8").tobytes())
-                    else:
-                        pub.send_command(frame["frame_id"], frame["timestamp"], cmd)
+                emit(cmd, frame)
                 line += f"\n          автопілот: {pilot.reason(cmd)}"
             print(line)
 
