@@ -73,6 +73,11 @@ _FDE_MODELS = {
     # Метричний варіант для ВІДКРИТИХ сцен. Саме його треба брати на
     # вулиці, інакше автопілот бачить стіну на два метри в усі боки.
     "dav2": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf",
+    "dav2_base": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf",
+    # Найменший. Потрібен тоді, коли на тій самій відеокарті вже сидить
+    # DPVO: на 8 ГБ великий варіант і DPVO разом не влазять, і той, хто
+    # просить пам'ять другим, отримує OOM.
+    "dav2_small": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf",
     "dav2_indoor": "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf",
 }
 
@@ -273,6 +278,11 @@ def main():
     ap.add_argument("--show", action="store_true",
                      help="відкрити вікно з останнім отриманим кадром (tkinter, живе у WSL "
                           "через WSLg). Esc/закрити вікно -- зупиняє і сервер")
+    ap.add_argument("--fde_cpu", action="store_true",
+                     help="тримати модель глибини на процесорі, навіть із --gpu. "
+                          "Потрібно разом із --dpvo, якщо відеокарти не вистачає "
+                          "на обидві моделі: DPVO лишається на GPU, глибина йде "
+                          "на CPU і стає повільнішою, але OOM зникає")
     ap.add_argument("--gpu", action="store_true",
                      help="рахувати ZoeDepth на GPU замість CPU. Перевірено після оновлення "
                           "драйвера NVIDIA (621.01) і 'wsl --update' -- баг dxgkrnl, що раніше "
@@ -287,7 +297,7 @@ def main():
     args = ap.parse_args()
 
     compute = fake_vslam_and_fde if args.fake else my_vslam_and_fde
-    _use_gpu[0] = args.gpu
+    _use_gpu[0] = args.gpu and not args.fde_cpu
     _fde_name[0] = args.fde
     if args.dpvo and not args.fake:
         from dpvo_client import DpvoClient

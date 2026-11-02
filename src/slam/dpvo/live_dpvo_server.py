@@ -94,8 +94,20 @@ def current_pose_and_landmarks(slam):
     відносно звичного T_wc (камера -> світ), яке чекає наш конвеєр."""
     pose = SE3(slam.pg.poses_[slam.n - 1]).inv()
     T_wc = pose.matrix().detach().cpu().numpy().reshape(4, 4).astype(np.float64)
+
+    # pg.points_ це БУФЕР torch.zeros, який заповнюється лише в update(),
+    # тобто вже після ініціалізації. До того slam.m уже рахує латки, і
+    # points_[:m] віддає чисті нулі. Якщо їх віддати як опорні точки, на
+    # приймачі вони виглядають як хмара в початку координат: усі позаду
+    # камери, глибина нуль, жодна не доходить до кадру. Тому поки DPVO не
+    # ініціалізувався, чесніше віддати None, ніж нулі.
+    if not slam.is_initialized:
+        return T_wc, None
     landmarks = slam.pg.points_.detach().cpu().numpy()[:slam.m].astype(np.float32)
-    return T_wc, landmarks
+    # підстраховка: окремі латки можуть лишатись незаповненими
+    nz = np.abs(landmarks).sum(axis=1) > 0
+    landmarks = landmarks[nz].astype(np.float32)
+    return T_wc, (landmarks if len(landmarks) else None)
 
 
 def main():
