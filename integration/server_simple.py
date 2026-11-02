@@ -63,6 +63,7 @@ _vo_step = [0]
 _use_gpu = [False]      # виставляється з --gpu у main(), безпечний дефолт -- CPU
 _dpvo_client = [None]
 _dpvo_addr = ["127.0.0.1", 8600]   # виставляється з --dpvo_host/--dpvo_port у main()
+_dpvo_fail = [0]    # скільки кадрів поспіль живий DPVO не відповів
 
 
 _FDE_MODELS = {
@@ -138,12 +139,25 @@ def my_vslam_and_fde(image, have_depth, have_pose):
             try:
                 T_wc, landmarks, initialized = _dpvo_client[0].track(
                     _vo_step[0], image_rgb, out["K"])
+                if _dpvo_fail[0]:
+                    print(f"          живий DPVO знову відповідає "
+                          f"(пропущено кадрів: {_dpvo_fail[0]})")
+                    _dpvo_fail[0] = 0
                 out["_dpvo"] = dict(_dpvo_client[0].last)
                 out["_dpvo"].pop("landmarks", None)      # не тягнемо хмару далі
                 out["_dpvo"].pop("T_wc", None)
                 dpvo_result = (T_wc, landmarks) if T_wc is not None else "warming_up"
             except (ConnectionError, OSError) as e:
-                print(f"живий DPVO недоступний ({e}), фіктивна поза цей кадр")
+                # Фіктивну позу сюди підставляти НЕ можна: вона потрапила б у
+                # ту саму карту, що й справжні, і зсунула б усе, що вже
+                # накопичено. Чесніше пропустити кадр -- далі його підхопить
+                # розгін, який принаймні не бреше про положення.
+                kind = "не встиг за 8 с" if isinstance(e, TimeoutError) else str(e)
+                _dpvo_fail[0] += 1
+                if _dpvo_fail[0] == 1 or _dpvo_fail[0] % 100 == 0:
+                    print(f"          живий DPVO {kind}, кадр пропускаю, працює "
+                          f"розгін (таких кадрів уже {_dpvo_fail[0]})")
+                return out
 
         if dpvo_result == "warming_up":
             return out      # без T_wc -- сервер сам пропустить кадр, це нормально

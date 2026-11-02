@@ -34,9 +34,21 @@ def _send_msg(sock, obj):
 
 
 class DpvoClient:
-    def __init__(self, host="127.0.0.1", port=8600, connect_timeout=5.0):
+    def __init__(self, host="127.0.0.1", port=8600, connect_timeout=5.0,
+                 read_timeout=8.0):
+        """read_timeout -- скільки найдовше чекати відповіді на один кадр.
+
+        Без нього сокет чекає вічно, і якщо DPVO спіткнеться (а він ділить
+        відеокарту з моделлю глибини), увесь сервер завмирає назавжди:
+        кадри далі приходять, але назад не йде нічого, і в лозі ані
+        помилки, ані рядка. Саме так це й виглядало -- лічильник
+        відповідей застигав, а лічильник кадрів ріс далі.
+
+        Вісім секунд це свідомо багато: при ініціалізації DPVO ганяє
+        дванадцять проходів оптимізації поспіль, і це законно довго."""
         self.host, self.port = host, port
         self.connect_timeout = connect_timeout
+        self.read_timeout = read_timeout
         self.sock = None
         self.last = {}
 
@@ -45,7 +57,10 @@ class DpvoClient:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(self.connect_timeout)
             s.connect((self.host, self.port))
-            s.settimeout(None)
+            # socket.timeout успадковує OSError, тому track() нижче ловить
+            # його разом з розривами і скидає сокет: наступний кадр
+            # перепідключиться, а DPVO на новому з'єднанні скине стан
+            s.settimeout(self.read_timeout)
             self.sock = s
 
     def track(self, frame_id, image_rgb, K):
