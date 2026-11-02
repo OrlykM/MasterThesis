@@ -138,6 +138,9 @@ def my_vslam_and_fde(image, have_depth, have_pose):
             try:
                 T_wc, landmarks, initialized = _dpvo_client[0].track(
                     _vo_step[0], image_rgb, out["K"])
+                out["_dpvo"] = dict(_dpvo_client[0].last)
+                out["_dpvo"].pop("landmarks", None)      # не тягнемо хмару далі
+                out["_dpvo"].pop("T_wc", None)
                 dpvo_result = (T_wc, landmarks) if T_wc is not None else "warming_up"
             except (ConnectionError, OSError) as e:
                 print(f"живий DPVO недоступний ({e}), фіктивна поза цей кадр")
@@ -344,6 +347,7 @@ def main():
     pub = None
     skipped = [None, 0]        # остання причина пропуску і скільки кадрів поспіль
     pub_addr = [None]          # кому відповідаємо, щоб ловити зміну джерела
+    dpvo_state = [-1]          # скільки ключових кадрів DPVO мав минулого разу
     pilot = (None if args.no_autopilot else
              ReactiveAutopilot(drone_radius=args.drone_radius, max_speed=args.max_speed,
                                 unknown_is_risk=args.cautious))
@@ -462,6 +466,23 @@ def main():
                 T_wc = T_wc if T_wc is not None else extra.get("T_wc")
                 K = K if K is not None else extra.get("K")
                 landmarks = landmarks if landmarks is not None else extra.get("landmarks")
+
+            dp = extra.get("_dpvo") if need else None
+            if dp is not None:
+                n_kf = dp.get("n", 0)
+                if n_kf != dpvo_state[0] or (n % 50 == 0 and n):
+                    dpvo_state[0] = n_kf
+                    pos = (np.asarray(T_wc, dtype=np.float64)[:3, 3]
+                           if T_wc is not None else None)
+                    where = (f"поза ({pos[0]:+.2f}, {pos[1]:+.2f}, {pos[2]:+.2f}) м"
+                             if pos is not None else "пози ще немає")
+                    if dp.get("initialized"):
+                        print(f"          DPVO: ключових кадрів {n_kf}, "
+                              f"ініціалізований, {where}")
+                    else:
+                        print(f"          DPVO: ключових кадрів {n_kf} з 8, ще не "
+                              f"ініціалізований, {where}. Кадр стає ключовим лише "
+                              f"коли між кадрами видно хоча б 2 пікселі руху")
 
             if depth is None or T_wc is None or K is None:
                 missing = [nm for nm, v in (("глибини", depth), ("пози", T_wc),

@@ -38,6 +38,7 @@ class DpvoClient:
         self.host, self.port = host, port
         self.connect_timeout = connect_timeout
         self.sock = None
+        self.last = {}
 
     def _ensure_connected(self):
         if self.sock is None:
@@ -49,7 +50,13 @@ class DpvoClient:
 
     def track(self, frame_id, image_rgb, K):
         """Один кадр -> (T_wc або None, landmarks або None, initialized).
-        None означає "DPVO ще розганяється" (перші ~8 кадрів), не помилку."""
+        None означає "DPVO ще розганяється" (перші ~8 кадрів), не помилку.
+
+        Після виклику в .last лежить уся відповідь, разом з `n`, тобто
+        скільки ключових кадрів DPVO уже набрав. Це єдиний спосіб ззовні
+        побачити, чи він узагалі рухається до ініціалізації: вона настає
+        рівно на восьмому ключовому кадрі, а кадр стає ключовим лише коли
+        мережа бачить щонайменше два пікселі руху."""
         self._ensure_connected()
         try:
             _send_msg(self.sock, {"frame_id": frame_id, "image": image_rgb, "K": K})
@@ -57,6 +64,7 @@ class DpvoClient:
         except (ConnectionError, OSError):
             self.sock = None       # наступний виклик спробує перепідключитись
             raise
+        self.last = reply
         return reply["T_wc"], reply["landmarks"], reply["initialized"]
 
     def close(self):
