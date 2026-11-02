@@ -58,10 +58,23 @@ from udp_streaming import FrameReceiver, MapPublisher, TcpFrameServer, RawJpegFr
 # ===========================================================================
 
 _zoedepth_pipe = [None]
+_fde_name = ["zoedepth"]    # виставляється з --fde у main()
 _vo_step = [0]
 _use_gpu = [False]      # виставляється з --gpu у main(), безпечний дефолт -- CPU
 _dpvo_client = [None]
 _dpvo_addr = ["127.0.0.1", 8600]   # виставляється з --dpvo_host/--dpvo_port у main()
+
+
+_FDE_MODELS = {
+    # Та сама модель, що в офлайн-конвеєрі. НАВЧЕНА В ПРИМІЩЕННІ: на
+    # відкритій сцені стискає все в кілька метрів і небу теж дає кінцеву
+    # відстань. Виміряно на лісовому кадрі: увесь кадр від 2,00 до 4,54 м.
+    "zoedepth": "Intel/zoedepth-nyu-kitti",
+    # Метричний варіант для ВІДКРИТИХ сцен. Саме його треба брати на
+    # вулиці, інакше автопілот бачить стіну на два метри в усі боки.
+    "dav2": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf",
+    "dav2_indoor": "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf",
+}
 
 
 def _get_zoedepth(use_gpu):
@@ -77,10 +90,11 @@ def _get_zoedepth(use_gpu):
         import torch
         from transformers import pipeline
         device_idx = 0 if (use_gpu and torch.cuda.is_available()) else -1
-        print(f"завантажую ZoeDepth ({'GPU' if device_idx == 0 else 'CPU'})...")
-        _zoedepth_pipe[0] = pipeline("depth-estimation", model="Intel/zoedepth-nyu-kitti",
+        model_id = _FDE_MODELS[_fde_name[0]]
+        print(f"завантажую {model_id} ({'GPU' if device_idx == 0 else 'CPU'})...")
+        _zoedepth_pipe[0] = pipeline("depth-estimation", model=model_id,
                                       device=device_idx)
-        print("ZoeDepth завантажено\n")
+        print("модель глибини завантажена\n")
     return _zoedepth_pipe[0]
 
 
@@ -239,6 +253,16 @@ def main():
                           "все підряд як 11 чисел, саме це і виглядає як 'фігня'")
     ap.add_argument("--save_to", default=None,
                      help="куди писати карту, наприклад ../live_map. Без цього не пише")
+    ap.add_argument("--queue_frames", type=int, default=1,
+                     help="скільки найсвіжіших кадрів тримати в черзі. 1 означає "
+                          "рахувати по тому, що камера зняла щойно, і викидати все, "
+                          "що сервер не встиг. Більше число додає затримку: кадри "
+                          "чекають у черзі, і команда описує вже застаріле минуле")
+    ap.add_argument("--fde", default="zoedepth", choices=sorted(_FDE_MODELS),
+                     help="модель глибини. zoedepth навчена в приміщенні і на "
+                          "відкритій сцені стискає все в кілька метрів, тому для "
+                          "вулиці бери dav2 (метричний Depth Anything V2 для "
+                          "відкритих сцен)")
     ap.add_argument("--up_axis", type=int, default=2, choices=(0, 1, 2),
                      help="яка вісь світу вертикальна, для вигляду згори у --show_map. "
                           "У наборах цього проєкту це Z, тобто 2")
@@ -264,6 +288,7 @@ def main():
 
     compute = fake_vslam_and_fde if args.fake else my_vslam_and_fde
     _use_gpu[0] = args.gpu
+    _fde_name[0] = args.fde
     if args.dpvo and not args.fake:
         from dpvo_client import DpvoClient
         _dpvo_client[0] = DpvoClient(host=args.dpvo_host, port=args.dpvo_port)
@@ -277,8 +302,10 @@ def main():
         print(f"TCP, чекаю з'єднання на порту {args.port}")
         print("відповідь піде тим самим з'єднанням\n")
     elif args.raw_jpeg:
-        rx = RawJpegFrameReceiver("0.0.0.0", args.port)
+        rx = RawJpegFrameReceiver("0.0.0.0", args.port, max_queue=args.queue_frames)
         print(f"UDP (сирий JPEG, без протоколу OVM1), чекаю кадри на порту {args.port}")
+        print(f"у черзі тримаю {args.queue_frames} найсвіжіших кадрів, решту викидаю, "
+              f"щоб команда не відставала")
         print(f"карту віддаю на порт {args.reply_port} тому, хто під'єднався\n")
     else:
         rx = FrameReceiver("0.0.0.0", args.port)
@@ -495,6 +522,11 @@ def main():
                     f"довіра {res['mean_weight']:.2f}, змінено {len(res['delta_idx']):5d} "
                     f"вокселів, усього зайнято "
                     f"{int(mapper.adaptive_grid.occupied_mask().sum())}")
+            lag = time.time() - frame["timestamp"]
+            drop = getattr(rx, "dropped", None)
+            if drop is not None:
+                line += (f"\n          затримка кадру {1000*lag:.0f} мс, "
+                         f"викинуто застарілих {drop}")
             if pilot is not None:
                 cmd = pilot.step(res["confidence"], res["depth_calibrated"], K, T_wc)
                 emit(cmd, frame)

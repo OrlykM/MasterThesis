@@ -29,6 +29,7 @@ Wire format, big-endian, one UDP datagram per chunk:
     chunk_len  I    length of the chunk payload that follows
     payload    ...  chunk_len bytes (a slice of the zlib-compressed message)
 """
+import collections
 import socket
 import struct
 import threading
@@ -473,26 +474,71 @@ class RawJpegFrameReceiver:
     сервері (чи заглушка --fake), так само, як для кадру "лише картинка",
     надісланого через client.py."""
 
-    def __init__(self, host, port, poll_timeout=0.5):
+    def __init__(self, host, port, poll_timeout=0.5, max_queue=1):
+        """max_queue -- скільки найсвіжіших кадрів тримати. 1 означає
+        "обробляй те, що зняла камера щойно, решту викинь", і це правильна
+        умова для шару безпеки.
+
+        Чому взагалі потрібен окремий потік. Якщо читати датаграми в тому
+        самому циклі, що й обробляти, вони накопичуються в буфері ядра, а
+        recvfrom віддає НАЙСТАРІШУ. При буфері 4 МБ і кадрі 45 КБ це
+        дев'яносто кадрів запасу, тобто при 2,5 кадру за секунду команда
+        відповідає тому, що камера бачила півхвилини тому. Коли буфер
+        заповнюється, ядро починає мовчки викидати нові кадри, і сервер
+        назавжди лишається працювати зі старим вікном."""
         self.sock = _make_socket(socket.SO_RCVBUF, 4 * 1024 * 1024)
         self.sock.bind((host, port))
         self.sock.settimeout(poll_timeout)
         self._next_id = 0
+        self._q = collections.deque(maxlen=max(1, int(max_queue)))
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._n_rx = 0          # скільки датаграм прийнято
+        self._n_dropped = 0     # скільки витиснуто з черги як застарілі
+        self._last_rx = time.monotonic()
+        self._thread = threading.Thread(target=self._rx_loop, daemon=True)
+        self._thread.start()
+
+    def _rx_loop(self):
+        while not self._stop.is_set():
+            try:
+                data, addr = self.sock.recvfrom(_MAX_DATAGRAM)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            # Мітку часу ставимо ТУТ, у мить отримання, а не тоді, коли кадр
+            # вийде з черги. Інакше очікування в черзі ніде не видно: і
+            # звіт про затримку, і мітка у векторі керування показували б
+            # нуль навіть при півхвилинному відставанні.
+            t_rx = time.time()
+            with self._lock:
+                self._n_rx += 1
+                self._last_rx = time.monotonic()
+                if len(self._q) == self._q.maxlen:
+                    self._n_dropped += 1          # deque зараз витисне найстаріший
+                self._q.append((data, addr, t_rx))
+
+    @property
+    def dropped(self):
+        """Скільки кадрів витиснуто з черги як застарілі. Це не втрата в
+        мережі, а свідомий вибір свіжості замість повноти."""
+        return self._n_dropped
 
     def frames(self, idle_timeout=None):
         import io
         from PIL import Image
 
-        last_rx = time.monotonic()
         while True:
-            try:
-                data, addr = self.sock.recvfrom(_MAX_DATAGRAM)
-            except socket.timeout:
-                if idle_timeout is not None and time.monotonic() - last_rx > idle_timeout:
+            with self._lock:
+                item = self._q.popleft() if self._q else None
+                idle = time.monotonic() - self._last_rx
+            if item is None:
+                if idle_timeout is not None and idle > idle_timeout:
                     return
+                time.sleep(0.002)
                 continue
-            last_rx = time.monotonic()
-
+            data, addr, t_rx = item
             jpeg = extract_jpeg(data)
             if jpeg is None:
                 continue
@@ -502,11 +548,12 @@ class RawJpegFrameReceiver:
                 continue
 
             frame_id, self._next_id = self._next_id, self._next_id + 1
-            yield {"timestamp": time.time(), "K": None, "T_wc": None, "pose_x": 0.0,
+            yield {"timestamp": t_rx, "K": None, "T_wc": None, "pose_x": 0.0,
                    "depth": None, "image": image, "landmarks": None,
                    "frame_id": frame_id, "src_addr": addr}
 
     def close(self):
+        self._stop.set()
         self.sock.close()
 
 
