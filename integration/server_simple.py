@@ -362,6 +362,7 @@ def main():
     skipped = [None, 0]        # остання причина пропуску і скільки кадрів поспіль
     pub_addr = [None]          # кому відповідаємо, щоб ловити зміну джерела
     dpvo_state = [-1]          # скільки ключових кадрів DPVO мав минулого разу
+    beat = [time.monotonic()]  # коли востаннє друкували пульс
     pilot = (None if args.no_autopilot else
              ReactiveAutopilot(drone_radius=args.drone_radius, max_speed=args.max_speed,
                                 unknown_is_risk=args.cautious))
@@ -481,6 +482,20 @@ def main():
                 K = K if K is not None else extra.get("K")
                 landmarks = landmarks if landmarks is not None else extra.get("landmarks")
 
+            now = time.monotonic()
+            if now - beat[0] >= 10.0:
+                beat[0] = now
+                dpv = ""
+                if need and extra.get("_dpvo"):
+                    e = extra["_dpvo"]
+                    mp = e.get("motion_px")
+                    dpv = (f", DPVO ініціалізований, ключових кадрів {e.get('n', 0)}"
+                           if e.get("initialized") else
+                           f", DPVO {e.get('n', 0)}/8"
+                           + (f", рух {mp:.1f} пкс" if mp is not None else ""))
+                print(f"[пульс] оброблено кадрів {n}, відкинуто застарілих "
+                      f"{getattr(rx, 'dropped', 0)}, розгінних команд {boot_sent[0]}{dpv}")
+
             dp = extra.get("_dpvo") if need else None
             if dp is not None:
                 n_kf = dp.get("n", 0)
@@ -494,9 +509,12 @@ def main():
                         print(f"          DPVO: ключових кадрів {n_kf}, "
                               f"ініціалізований, {where}")
                     else:
+                        mp = dp.get("motion_px")
+                        seen = (f", залишковий рух {mp:.1f} пкс "
+                                f"(нерухома камера дає близько 0,2)"
+                                if mp is not None else "")
                         print(f"          DPVO: ключових кадрів {n_kf} з 8, ще не "
-                              f"ініціалізований, {where}. Кадр стає ключовим лише "
-                              f"коли між кадрами видно хоча б 2 пікселі руху")
+                              f"ініціалізований{seen}")
 
             if depth is None or T_wc is None or K is None:
                 missing = [nm for nm, v in (("глибини", depth), ("пози", T_wc),
