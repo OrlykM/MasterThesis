@@ -64,6 +64,58 @@ _use_gpu = [False]      # виставляється з --gpu у main(), без�
 _dpvo_client = [None]
 _dpvo_addr = ["127.0.0.1", 8600]   # виставляється з --dpvo_host/--dpvo_port у main()
 _dpvo_fail = [0]    # скільки кадрів поспіль живий DPVO не відповів
+_dpvo_every = [0]   # 0 означає підбирати крок самому, з --dpvo_every
+_dpvo_seen = [0]    # скільки кадрів пройшло з останнього, відданого DPVO
+_dpvo_auto = {"stride": 1, "sent": 0, "last_n": 0, "cap": 32}
+_fov_deg = [None]   # кут огляду камери, з --fov_deg; None -- здогадка 0.8*w
+
+
+def _tune_stride(rep):
+    """Підбір кроку між кадрами, які отримує DPVO.
+
+    Рахуємо не навпомацки, а з виміряного. `motion_px` для ВІДХИЛЕНОГО кадру
+    дорівнює саме тому числу, з яким DPVO порівнює свій поріг 2 пікселі, бо
+    стан після відхилення не змінився. Тому потрібне збільшення кроку видно
+    прямо: якщо бачимо 0,6 пікселя, а треба 2, крок має вирости приблизно
+    втричі.
+
+    Виміряно на наборі №1: крок 1 за 50 кадрів доводить лише до 7 ключових і
+    ініціалізації немає, крок 15 дає ініціалізацію на 24-му кадрі."""
+    a = _dpvo_auto
+    n_now = rep.get("n", 0)
+    if rep.get("initialized"):
+        if a["stride"] != 1:
+            print(f"          DPVO ініціалізувався, крок повертаю "
+                  f"з {a['stride']} на 1")
+        a["stride"], a["sent"] = 1, 0
+    elif n_now > a["last_n"]:
+        a["sent"] = 0                      # кадр прийнято, крок лишаємо
+    else:
+        a["sent"] += 1
+        mp = rep.get("motion_px")
+        if a["sent"] >= 3 and a["stride"] < a["cap"]:
+            # 2,2 замість 2,0 -- невеликий запас над порогом
+            factor = 2.0 if not mp or mp <= 0.05 else min(4.0, max(1.5, 2.2 / mp))
+            new = min(a["cap"], max(a["stride"] + 1,
+                                     int(round(a["stride"] * factor))))
+            if new != a["stride"]:
+                a["stride"], a["sent"] = new, 0
+                seen = f", бачимо {mp:.1f} пкс замість потрібних 2.0" if mp else ""
+                print(f"          ключові кадри не ростуть{seen}: даю DPVO "
+                      f"більшу базу, кожен {new}-й кадр")
+    a["last_n"] = n_now
+
+
+def _intrinsics(h, w):
+    """Матриця камери. Якщо кут огляду не заданий, лишається стара здогадка
+    fx = 0,8·w. Вона бралась зі стелі: для камери з кутом огляду 90° правильне
+    значення це w/2, тобто здогадка завищує фокусну на 60 %, а від неї
+    залежить уся геометрія і VSLAM, і зворотного проєктування глибини."""
+    if _fov_deg[0]:
+        fx = fy = w / (2.0 * np.tan(np.deg2rad(_fov_deg[0]) / 2.0))
+    else:
+        fx = fy = 0.8 * w
+    return np.array([[fx, 0, w / 2.0], [0, fy, h / 2.0], [0, 0, 1]], dtype=np.float64)
 
 
 _FDE_MODELS = {
@@ -129,16 +181,34 @@ def my_vslam_and_fde(image, have_depth, have_pose):
             depth = np.array(Image.fromarray(depth).resize((w, h), Image.BILINEAR))
         out["depth"] = depth
 
-    fx = fy = 0.8 * w
-    cx, cy = w / 2.0, h / 2.0
-    out["K"] = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    out["K"] = _intrinsics(h, w)
+    cx, cy = out["K"][0, 2], out["K"][1, 2]
+    fx, fy = out["K"][0, 0], out["K"][1, 1]
 
     if not have_pose:
         dpvo_result = None
+        # DPVO навчався на зсувах від 16 до 72 пікселів між кадрами, а до
+        # ініціалізації приймає кадр лише коли бачить щонайменше 2 пікселі
+        # руху. Якщо апарат повзе, сусідні кадри для нього однакові, жоден не
+        # стає ключовим, і ініціалізація не настає НІКОЛИ.
+        #
+        # Лікується базою: віддавати DPVO кожен N-й кадр, решту пропускати, на
+        # них працює розгін. Потрібне N наперед не вгадати, воно залежить і
+        # від швидкості апарата, і від того, як далеко сцена. Тому за
+        # замовчуванням крок підбирається сам: поки ключові кадри не ростуть,
+        # він подвоюється, а щойно DPVO ініціалізувався, повертається до 1,
+        # бо далі DPVO сам вирішує, що вважати ключовим кадром.
+        stride = _dpvo_every[0] or _dpvo_auto["stride"]
+        _dpvo_seen[0] += 1
+        if _dpvo_client[0] is not None and _dpvo_seen[0] < stride:
+            return out          # без пози -- кадр підхопить розгін
+        _dpvo_seen[0] = 0
         if _dpvo_client[0] is not None:
             try:
                 T_wc, landmarks, initialized = _dpvo_client[0].track(
                     _vo_step[0], image_rgb, out["K"])
+                if not _dpvo_every[0]:
+                    _tune_stride(_dpvo_client[0].last)
                 if _dpvo_fail[0]:
                     print(f"          живий DPVO знову відповідає "
                           f"(пропущено кадрів: {_dpvo_fail[0]})")
@@ -194,9 +264,9 @@ _fake_step = [0]
 def fake_vslam_and_fde(image, have_depth, have_pose):
     h, w = image.shape[:2]
     out = {}
-    fx = fy = 0.8 * w
-    cx, cy = w / 2.0, h / 2.0
-    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    K = _intrinsics(h, w)
+    cx, cy = K[0, 2], K[1, 2]
+    fx, fy = K[0, 0], K[1, 1]
     out["K"] = K
 
     if not have_depth:
@@ -309,6 +379,18 @@ def main():
                           "контейнер з src/slam/dpvo/live_dpvo_server.py (дивись docstring "
                           "там же для docker run). Без --dpvo чи якщо з'єднання обірветься -- "
                           "фіктивна поза, як і раніше")
+    ap.add_argument("--dpvo_every", type=int, default=0,
+                     help="віддавати DPVO кожен N-й кадр. 0, за замовчуванням, "
+                          "означає підбирати крок самому: поки ключові кадри не "
+                          "ростуть, він подвоюється, а після ініціалізації "
+                          "повертається до 1. Потрібно тому, що DPVO навчався на "
+                          "зсувах від 16 до 72 пікселів і при повільному русі "
+                          "сусідні кадри для нього однакові")
+    ap.add_argument("--fov_deg", type=float, default=None,
+                     help="кут огляду камери за горизонталлю, градуси. Без нього "
+                          "фокусна береться як 0,8·ширина, а це здогадка: для "
+                          "камери на 90° правильно w/2, тобто здогадка завищує "
+                          "на 60 відсотків")
     ap.add_argument("--dpvo_host", default="127.0.0.1")
     ap.add_argument("--dpvo_port", type=int, default=8600)
     args = ap.parse_args()
@@ -316,6 +398,8 @@ def main():
     compute = fake_vslam_and_fde if args.fake else my_vslam_and_fde
     _use_gpu[0] = args.gpu and not args.fde_cpu
     _fde_name[0] = args.fde
+    _dpvo_every[0] = max(0, args.dpvo_every)
+    _fov_deg[0] = args.fov_deg
     if args.dpvo and not args.fake:
         from dpvo_client import DpvoClient
         _dpvo_client[0] = DpvoClient(host=args.dpvo_host, port=args.dpvo_port)
